@@ -32,7 +32,7 @@ You MUST respond with this EXACT JSON structure (no other keys):
 }
 
 ## Intent Types
-- ADD_TASK: User wants to add one or more tasks
+- ADD_TASK: User wants to add one or more tasks. ALSO use this when user confirms a bot suggestion ("yes", "yes please", "sure", "go ahead", "add it") and the conversation history shows the bot just proposed a task.
 - MODIFY_TASK: User wants to change an existing task
 - DELETE_TASK: User wants to remove a task
 - COMPLETE_TASK: User says "done", "finished", "completed"
@@ -42,8 +42,18 @@ You MUST respond with this EXACT JSON structure (no other keys):
 - ADD_HABIT: User mentions a recurring habit like "I nap after lunch"
 - REPLAN: User says "replan", "I'm tired", "change my schedule"
 - SHOW_PLAN: User asks "what's my plan?", "show schedule"
-- GENERAL_CHAT: Casual conversation, greetings, questions
+- GENERAL_CHAT: Casual conversation, greetings, questions NOT related to any pending bot action
 - IMAGE_CONTEXT: User sends an image with context
+
+## ⚠️ Conversation History Rule
+If the user's message is a short affirmation ("yes", "yes please", "sure", "ok", "go ahead", "do it", "sounds good", "perfect") or negation ("no", "nope", "cancel", "don't") — look at the LAST assistant message in the conversation history to determine what they are confirming or rejecting, then classify accordingly:
+- Bot proposed adding a task → ADD_TASK (re-extract the task from bot's message)
+- Bot proposed a replan → REPLAN
+- Bot asked to show the schedule → SHOW_PLAN
+- Bot proposed skipping something → SKIP_TASK
+- Bot asked to mark something done → COMPLETE_TASK
+- If negation ("no", "cancel") → GENERAL_CHAT with reasoning explaining what was cancelled
+Do NOT classify bare affirmations as GENERAL_CHAT when there is relevant context in history.
 
 ## Task Extraction (when intent is ADD_TASK)
 Each task in the "tasks" array should have:
@@ -86,6 +96,9 @@ Response: {"intent": "ADD_CONSTRAINT", "confidence": 0.9, "tasks": [{"title": "C
 
 User: "done with math"
 Response: {"intent": "COMPLETE_TASK", "confidence": 0.9, "tasks": [], "memorySignals": [], "taskReference": "math", "replanContext": null, "reasoning": "User completed a task related to math"}
+
+User: "yes please" (after bot said "Want me to add Quick catch-up with Ankit on May 9th?")
+Response: {"intent": "ADD_TASK", "confidence": 0.95, "tasks": [{"title": "Quick catch-up with Ankit", "description": "", "priority": 2, "cognitiveLoad": 1, "estimatedMinutes": 15, "dueDate": "2026-05-09", "preferredTime": "morning", "tags": [], "isFixed": true, "fixedStartTime": "10:15", "fixedEndTime": "10:30"}], "memorySignals": [], "taskReference": null, "replanContext": null, "reasoning": "User confirmed the task suggested by the bot in previous message"}
 
 CRITICAL: You MUST include "intent" and "confidence" as top-level keys. Do NOT wrap the response. Do NOT include a "thought" key. Return ONLY the JSON object.`;
 }
