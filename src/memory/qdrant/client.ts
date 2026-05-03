@@ -27,7 +27,6 @@ export async function initQdrantCollections(): Promise<void> {
     const exists = collections.collections.some(c => c.name === MEMORY_COLLECTION);
 
     if (exists) {
-      // Check if the existing collection has the right dimensions
       const info = await qdrant.getCollection(MEMORY_COLLECTION);
       const currentSize = (info.config?.params?.vectors as any)?.size;
 
@@ -41,6 +40,9 @@ export async function initQdrantCollections(): Promise<void> {
     } else {
       await createCollection(qdrant, requiredSize);
     }
+
+    // Ensure payload indexes exist (Qdrant Cloud requires these for filtered search)
+    await ensurePayloadIndexes(qdrant);
   } catch (error) {
     log.error({ error }, 'Failed to initialize Qdrant collections');
     throw error;
@@ -55,4 +57,33 @@ async function createCollection(qdrant: QdrantClient, size: number): Promise<voi
     },
   });
   log.info({ size }, `Created Qdrant collection: ${MEMORY_COLLECTION}`);
+}
+
+/**
+ * Create payload indexes for fields used in filters.
+ * Qdrant Cloud enforces this; local Qdrant allows unindexed filter fields.
+ * createPayloadIndex is idempotent — safe to call on every startup.
+ */
+async function ensurePayloadIndexes(qdrant: QdrantClient): Promise<void> {
+  const indexes: Array<{ field: string; schema: any }> = [
+    { field: 'telegramId', schema: { type: 'integer', lookup: true } },
+    { field: 'type',       schema: { type: 'keyword' } },
+    { field: 'userId',     schema: { type: 'keyword' } },
+  ];
+
+  for (const { field, schema } of indexes) {
+    try {
+      await qdrant.createPayloadIndex(MEMORY_COLLECTION, {
+        field_name: field,
+        field_schema: schema,
+      });
+      log.debug({ field }, 'Payload index ensured');
+    } catch (err: any) {
+      // "already exists" is fine — ignore it
+      if (!err?.message?.includes('already exists')) {
+        log.warn({ field, err: err?.message }, 'Could not create payload index');
+      }
+    }
+  }
+  log.info('Qdrant payload indexes ready');
 }

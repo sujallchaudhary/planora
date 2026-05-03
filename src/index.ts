@@ -35,30 +35,11 @@ async function main() {
   const server = await createServer();
   await startServer(server);
 
-  // Step 6: Start Telegram bot (webhook with retry, or polling in dev)
+  // Step 6: Start Telegram bot (webhook or polling)
   try {
     await startBot();
   } catch (err) {
-    logger.warn({ err }, 'Webhook registration failed — retrying in background...');
-    (async () => {
-      const { getBotInstance } = await import('./bot/bot.js');
-      const b = getBotInstance();
-      let delay = 30_000;
-      const maxDelay = 300_000;
-      while (true) {
-        await new Promise(r => setTimeout(r, delay));
-        try {
-          await b.api.setWebhook(env.TELEGRAM_WEBHOOK_URL!, {
-            secret_token: env.TELEGRAM_WEBHOOK_SECRET || undefined,
-          });
-          logger.info({ url: env.TELEGRAM_WEBHOOK_URL }, 'Webhook registered successfully (retry)');
-          break;
-        } catch (retryErr) {
-          delay = Math.min(delay * 2, maxDelay);
-          logger.warn({ retryErr, nextRetryMs: delay }, 'Webhook retry failed — will try again');
-        }
-      }
-    })();
+    logger.warn({ err }, 'Webhook registration failed — run scripts/set-webhook.sh once DNS is ready.');
   }
 
   // Step 7: Schedule periodic jobs
