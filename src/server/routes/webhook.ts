@@ -7,7 +7,10 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
   if (!env.TELEGRAM_WEBHOOK_URL) return;
 
   const bot = getBotInstance();
-  const handleWebhook = webhookCallback(bot, 'fastify');
+  const handleWebhook = webhookCallback(bot, 'fastify', {
+    onTimeout: 'return',
+    timeoutMilliseconds: 0,
+  });
 
   app.post('/telegram/webhook', async (request, reply) => {
     // Verify secret token if configured
