@@ -102,6 +102,10 @@ export async function planSchedule(
   // Step 1: Lock fixed constraints
   const occupiedSlots: TimeSlot[] = [];
 
+  /** Convert snake_case key to Title Case for display */
+  const prettyKey = (key: string) =>
+    key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
   for (const constraint of memory.constraints) {
     const dayOfWeek = baseDate.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
     const isApplicable = constraint.days.includes('daily') || constraint.days.includes(dayOfWeek);
@@ -111,7 +115,7 @@ export async function planSchedule(
       const end = parseTimeString(constraint.timeRange.end, baseDate, config.timezone);
       occupiedSlots.push({ start, end });
       entries.push({
-        title: constraint.key,
+        title: prettyKey(constraint.key),
         description: constraint.description,
         startTime: start,
         endTime: end,
@@ -133,7 +137,7 @@ export async function planSchedule(
       const end = parseTimeString(habit.timeRange.end, baseDate, config.timezone);
       occupiedSlots.push({ start, end });
       entries.push({
-        title: habit.key,
+        title: prettyKey(habit.key),
         description: habit.description,
         startTime: start,
         endTime: end,

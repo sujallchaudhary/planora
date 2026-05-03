@@ -1,6 +1,7 @@
 import type { Context } from 'grammy';
 import { runAgent } from '../../agent/graph.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
+import { appendHistory } from '../conversation-history.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('handler:message');
@@ -23,6 +24,9 @@ export function registerMessageHandler(bot: any): void {
       username: from.username,
     });
 
+    // Save user message to history BEFORE running agent (so it's available to classify)
+    appendHistory(from.id, 'user', text);
+
     try {
       const response = await runAgent({
         userId: user._id.toString(),
@@ -31,8 +35,10 @@ export function registerMessageHandler(bot: any): void {
         rawInput: text,
       });
 
+      // Save bot response so next message has full context
+      appendHistory(from.id, 'assistant', response);
+
       await ctx.reply(response, { parse_mode: 'Markdown' }).catch(() => {
-        // Fallback without markdown if it fails
         return ctx.reply(response);
       });
     } catch (error) {
