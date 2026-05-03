@@ -1,0 +1,40 @@
+{
+  "name": "telegram-assistant",
+  "version": "1.0.0",
+  "description": "Production-grade Telegram-first personal assistant agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.2.0",
+    "@langchain/openai": "^0.3.0",
+    "@qdrant/js-client-rest": "^1.12.0",
+    "bullmq": "^5.0.0",
+    "date-fns": "^4.1.0",
+    "date-fns-tz": "^3.2.0",
+    "dotenv": "^16.4.0",
+    "fastify": "^5.0.0",
+    "@fastify/multipart": "^9.0.0",
+    "grammy": "^1.30.0",
+    "ioredis": "^5.4.0",
+    "mongoose": "^8.8.0",
+    "openai": "^4.70.0",
+    "pino": "^9.5.0",
+    "pino-pretty": "^13.0.0",
+    "uuid": "^11.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
