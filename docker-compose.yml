@@ -22,7 +22,7 @@ services:
       REDIS_URL: redis://redis:6379
       NODE_ENV: production
     ports:
-      - "3000:3000"
+      - "${PORT:-4543}:${PORT:-4543}"
     depends_on:
       redis:
         condition: service_healthy
