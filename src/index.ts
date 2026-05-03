@@ -36,7 +36,17 @@ async function main() {
   await startServer(server);
 
   // Step 6: Start Telegram bot (polling or webhook)
-  await startBot();
+  try {
+    await startBot();
+  } catch (err) {
+    logger.warn({ err }, 'Webhook registration failed — falling back to polling mode. Fix DNS and restart to enable webhook.');
+    // Fall back to polling so the bot stays alive
+    const { getBotInstance } = await import('./bot/bot.js');
+    const b = getBotInstance();
+    await b.api.deleteWebhook();
+    b.start({ onStart: () => logger.info('Bot started (polling fallback)') });
+  }
+
 
   // Step 7: Schedule periodic jobs
   try {
