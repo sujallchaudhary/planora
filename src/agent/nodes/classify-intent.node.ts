@@ -5,6 +5,7 @@ import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
 import { nowInTimezone, formatTime, formatDateString, todayString } from '../../utils/date.js';
+import { getHistory } from '../../bot/conversation-history.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('node:classify');
@@ -27,7 +28,9 @@ export async function classifyIntentNode(state: AgentState): Promise<Partial<Age
     currentDate: formatDateString(now, config.timezone),
     pendingTaskCount: pendingCount,
     hasScheduleToday: !!todaySchedule && todaySchedule.entries.length > 0,
+    conversationHistory: getHistory(state.telegramId),
   };
+
 
   // If there's an image, process it first and include context
   let inputText = state.rawInput;

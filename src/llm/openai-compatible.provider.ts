@@ -70,6 +70,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
         max_tokens: this.maxTokens,
         messages: [
           { role: 'system', content: systemPrompt },
+          // Inject last few turns so model has follow-up context
+          ...(context.conversationHistory ?? []),
           { role: 'user', content: input },
         ],
         response_format: { type: 'json_object' },
@@ -171,10 +173,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
     try {
       const response = await this.chatClient.chat.completions.create({
         model: this.chatModel,
-        temperature: this.temperature + 0.2, // Slightly more creative for responses
+        temperature: this.temperature + 0.2,
         max_tokens: this.maxTokens,
         messages: [
           { role: 'system', content: systemPrompt },
+          // Inject last few turns for conversational context
+          ...(context.conversationHistory ?? []),
           {
             role: 'user',
             content: JSON.stringify({
