@@ -10,9 +10,12 @@ export function INTENT_CLASSIFICATION_PROMPT(context: UserContext): string {
 - User: ${context.firstName}
 - Timezone: ${context.timezone}
 - Current Time: ${context.currentTime}
-- Current Date: ${context.currentDate}
+- Current Date (wall clock): ${context.currentDate}
 - Pending Tasks: ${context.pendingTaskCount}
 - Has Schedule Today: ${context.hasScheduleToday}
+${context.isLateNight
+  ? `\n## ⚠️ Late Night Planning Mode\nIt is ${context.currentTime} — the user is still awake planning before sleep.\nThey are planning for the day they will wake into (${context.planningDate}).\n- "today" → ${context.planningDate}\n- "tomorrow" → ${context.planningDate} (same day — they haven't slept yet)\n- "tonight" → ${context.planningDate}\nUse ${context.planningDate} as dueDate for any tasks referencing today or tomorrow.`
+  : `- Planning Date (today): ${context.planningDate ?? context.currentDate}\n- Tomorrow: ${context.tomorrowDate ?? 'next calendar day'}`}
 ${context.recentMemorySummary ? `- Recent Memory: ${context.recentMemorySummary}` : ''}
 
 ## Required Output Format

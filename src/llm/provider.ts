@@ -6,6 +6,12 @@ export interface UserContext {
   timezone: string;
   currentTime: string;
   currentDate: string;
+  /** The date the user considers 'today' — shifted back if before lateNightThresholdHour */
+  planningDate?: string;
+  /** The date the user considers 'tomorrow' — shifted accordingly */
+  tomorrowDate?: string;
+  /** True if current time is before the late-night threshold */
+  isLateNight?: boolean;
   pendingTaskCount: number;
   hasScheduleToday: boolean;
   recentMemorySummary?: string;

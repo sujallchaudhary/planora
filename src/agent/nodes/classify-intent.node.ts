@@ -4,7 +4,7 @@ import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
-import { nowInTimezone, formatTime, formatDateString, todayString } from '../../utils/date.js';
+import { nowInTimezone, formatTime, formatDateString, todayString, planningDateString, tomorrowString } from '../../utils/date.js';
 import { getHistory } from '../../bot/conversation-history.js';
 import { createChildLogger } from '../../utils/logger.js';
 
@@ -26,6 +26,10 @@ export async function classifyIntentNode(state: AgentState): Promise<Partial<Age
     timezone: config.timezone,
     currentTime: formatTime(now, config.timezone),
     currentDate: formatDateString(now, config.timezone),
+    // Late-night aware planning dates
+    planningDate: planningDateString(config.timezone, config.lateNightThresholdHour),
+    tomorrowDate: tomorrowString(config.timezone, config.lateNightThresholdHour),
+    isLateNight: now.getHours() < config.lateNightThresholdHour,
     pendingTaskCount: pendingCount,
     hasScheduleToday: !!todaySchedule && todaySchedule.entries.length > 0,
     conversationHistory: getHistory(state.telegramId),

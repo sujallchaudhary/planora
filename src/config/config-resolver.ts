@@ -13,6 +13,8 @@ export interface UserConfig {
   snoozeMinutes: number;
   memoryConfidenceThreshold: number;
   memoryMinDataPoints: number;
+  /** Hour (0-23) before which midnight is treated as still the previous night. Default: 4 */
+  lateNightThresholdHour: number;
 }
 
 // ─── Per-user settings stored in MongoDB (all optional overrides) ──────────────
@@ -28,6 +30,7 @@ export interface UserSettings {
   snoozeMinutes?: number;
   memoryConfidenceThreshold?: number;
   memoryMinDataPoints?: number;
+  lateNightThresholdHour?: number;
 }
 
 /**
@@ -53,5 +56,6 @@ export function resolveUserConfig(userSettings?: UserSettings | null): UserConfi
     snoozeMinutes: s.snoozeMinutes ?? SYSTEM_DEFAULTS.snoozeMinutes,
     memoryConfidenceThreshold: s.memoryConfidenceThreshold ?? SYSTEM_DEFAULTS.memoryConfidenceThreshold,
     memoryMinDataPoints: s.memoryMinDataPoints ?? SYSTEM_DEFAULTS.memoryMinDataPoints,
+    lateNightThresholdHour: s.lateNightThresholdHour ?? 4,
   };
 }

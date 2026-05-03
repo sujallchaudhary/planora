@@ -9,7 +9,8 @@ import { resolveUserConfig } from '../../config/config-resolver.js';
 import { planSchedule } from '../../scheduler/planner.js';
 import { replan } from '../../scheduler/replanner.js';
 import { syncReminders } from '../../execution/job-manager.js';
-import { todayString, nowInTimezone } from '../../utils/date.js';
+import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { planningDateString, nowInTimezone } from '../../utils/date.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('node:execute');
@@ -25,7 +26,8 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
   }
 
   const config = resolveUserConfig(user.settings);
-  const today = todayString(config.timezone);
+  // Use late-night-aware planning date — before 4 AM, "today" = yesterday
+  const today = planningDateString(config.timezone, config.lateNightThresholdHour);
 
   let result: ActionResult;
 
@@ -223,12 +225,12 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
     }
 
     case IntentType.REPLAN: {
-      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      const newEntries = await triggerReplan(state.telegramId, user._id.toString(), config, today);
       result = {
         success: true,
         action: 'replan',
-        message: 'Replanned the rest of your day',
-        data: { reason: state.intent.replanContext },
+        message: `Replanned your day — ${newEntries} tasks scheduled`,
+        data: { scheduledCount: newEntries, reason: state.intent.replanContext },
       };
       break;
     }
@@ -306,23 +308,31 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
   return { actionResult: result };
 }
 
-async function triggerReplan(telegramId: number, userId: string, config: any, today: string): Promise<void> {
+async function triggerReplan(telegramId: number, userId: string, config: any, today: string): Promise<number> {
   try {
     const tasks = await taskRepo.findPendingTasks(telegramId);
     const existingSchedule = await scheduleRepo.findByDate(telegramId, today);
     const userDoc = await userRepo.findByTelegramId(telegramId);
-    if (!userDoc) return;
+    if (!userDoc) return 0;
+
+    // Fetch real memory so replan respects habits and constraints
+    const llm = getLLMProvider();
+    const { SemanticMemory } = await import('../../memory/qdrant/semantic-memory.js');
+    const { HybridRetriever } = await import('../../memory/hybrid-retriever.js');
+    const semanticMemory = new SemanticMemory((t: string) => llm.getEmbedding(t));
+    const retriever = new HybridRetriever(semanticMemory);
+    const memory = await retriever.retrieve(telegramId, `Replan for ${today}`, config.memoryConfidenceThreshold ?? 0.6).catch(() => ({
+      preferences: [],
+      habits: [],
+      constraints: [],
+      semanticContext: [],
+      recentHistory: [],
+    }));
 
     const newEntries = await replan(
       tasks,
       existingSchedule?.entries ?? [],
-      {
-        preferences: [],
-        habits: [],
-        constraints: [],
-        semanticContext: [],
-        recentHistory: [],
-      },
+      memory,
       config,
       today,
     );
@@ -330,7 +340,9 @@ async function triggerReplan(telegramId: number, userId: string, config: any, to
     const schedule = await scheduleRepo.createOrReplace(telegramId, userDoc._id, today, newEntries);
     await syncReminders(telegramId, today, schedule.entries);
     log.info({ telegramId, entries: newEntries.length }, 'Replanned schedule');
+    return newEntries.length;
   } catch (error) {
     log.error({ error }, 'Failed to replan');
+    return 0;
   }
 }

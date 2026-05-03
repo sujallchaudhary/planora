@@ -50,6 +50,37 @@ export function todayString(timezone: string): string {
 }
 
 /**
+ * Get the "planning date" string — what the user considers "today".
+ * In late-night mode (before threshold hour), this is the current calendar day
+ * (wall clock), since the user is planning for the day they'll wake into.
+ * e.g. at 2 AM on May 4th → planning date = May 4th.
+ */
+export function planningDateString(timezone: string, lateNightThresholdHour = 4): string {
+  // Planning date is always the wall clock date — no shift needed.
+  // The only thing late-night mode affects is what "tomorrow" resolves to.
+  return formatDateString(new Date(), timezone);
+}
+
+/**
+ * Get "tomorrow" relative to the user's planning perspective.
+ * In late-night mode (before threshold): "tomorrow" = today (wall clock),
+ * because the user hasn't slept yet and refers to the coming day as tomorrow.
+ * e.g. at 2 AM on May 4th: "tomorrow" = May 4th (not May 5th).
+ */
+export function tomorrowString(timezone: string, lateNightThresholdHour = 4): string {
+  const now = toZonedTime(new Date(), timezone);
+  const localHour = now.getHours();
+  // Before threshold: "tomorrow" = today (they'll sleep and wake to this day)
+  if (localHour < lateNightThresholdHour) {
+    return format(now, 'yyyy-MM-dd');
+  }
+  // Normal: tomorrow = +1 day
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return format(tomorrow, 'yyyy-MM-dd');
+}
+
+/**
  * Calculate the delay in milliseconds from now to a target time.
  * Returns 0 if the target is in the past.
  */
