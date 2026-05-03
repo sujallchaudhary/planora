@@ -5,7 +5,7 @@ import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
 import type { UserConfig } from '../config/config-resolver.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
-import { parseTimeString } from '../utils/date.js';
+import { parseTimeString, formatDateString } from '../utils/date.js';
 import { findAvailableSlots, type TimeSlot, fitsInSlot } from './time-slots.js';
 import { createChildLogger } from '../utils/logger.js';
 
@@ -86,16 +86,11 @@ export async function planSchedule(
 ): Promise<IScheduleEntry[]> {
   const entries: IScheduleEntry[] = [];
 
-  // Build baseDate as local midnight in user's timezone.
-  // new Date(targetDate) gives UTC midnight which shifts all HH:mm parsing for non-UTC timezones.
   const [y, m, d] = targetDate.split('-').map(Number);
-  // toZonedTime of a UTC midnight then fromZonedTime gets us the correct UTC instant that
-  // corresponds to 00:00:00 local time in the user's timezone.
-  const localMidnight = fromZonedTime(new Date(y!, m! - 1, d!), config.timezone);
-  const baseDate = toZonedTime(localMidnight, config.timezone);
+  const baseDateUTC = new Date(Date.UTC(y!, m! - 1, d!));
 
-  const workingStart = parseTimeString(config.workingHours.start, baseDate, config.timezone);
-  const workingEnd = parseTimeString(config.workingHours.end, baseDate, config.timezone);
+  const workingStart = parseTimeString(config.workingHours.start, targetDate, config.timezone);
+  const workingEnd = parseTimeString(config.workingHours.end, targetDate, config.timezone);
 
   log.info({ targetDate, tasks: tasks.length }, 'Planning schedule');
 
@@ -107,12 +102,12 @@ export async function planSchedule(
     key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
   for (const constraint of memory.constraints) {
-    const dayOfWeek = baseDate.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    const dayOfWeek = baseDateUTC.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
     const isApplicable = constraint.days.includes('daily') || constraint.days.includes(dayOfWeek);
 
     if (isApplicable && constraint.isActive) {
-      const start = parseTimeString(constraint.timeRange.start, baseDate, config.timezone);
-      const end = parseTimeString(constraint.timeRange.end, baseDate, config.timezone);
+      const start = parseTimeString(constraint.timeRange.start, targetDate, config.timezone);
+      const end = parseTimeString(constraint.timeRange.end, targetDate, config.timezone);
       occupiedSlots.push({ start, end });
       entries.push({
         title: prettyKey(constraint.key),
@@ -129,12 +124,12 @@ export async function planSchedule(
 
   // Step 2: Lock habits
   for (const habit of memory.habits) {
-    const dayOfWeek = baseDate.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    const dayOfWeek = baseDateUTC.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
     const isApplicable = habit.days.includes('daily') || habit.days.includes(dayOfWeek);
 
     if (isApplicable && habit.isActive) {
-      const start = parseTimeString(habit.timeRange.start, baseDate, config.timezone);
-      const end = parseTimeString(habit.timeRange.end, baseDate, config.timezone);
+      const start = parseTimeString(habit.timeRange.start, targetDate, config.timezone);
+      const end = parseTimeString(habit.timeRange.end, targetDate, config.timezone);
       occupiedSlots.push({ start, end });
       entries.push({
         title: prettyKey(habit.key),
@@ -149,13 +144,27 @@ export async function planSchedule(
     }
   }
 
-  // Step 3: Lock fixed-time tasks
-  const fixedTasks = tasks.filter(t => t.isFixed && t.fixedStartTime && t.fixedEndTime);
-  const flexibleTasks = tasks.filter(t => !t.isFixed);
+  // Step 3: Filter tasks and lock fixed-time tasks for TODAY
+  const validTasks = tasks.filter(t => {
+    // If a task is fixed and has a specific date, it MUST match the targetDate
+    if (t.isFixed && t.dueDate) {
+      const taskDateStr = formatDateString(t.dueDate, config.timezone);
+      if (taskDateStr !== targetDate) {
+        return false;
+      }
+    }
+    // For flexible tasks, we could also filter them out if their due date is in the future
+    // and we only want to do them ON that date, but for now we leave them to be scheduled
+    // if there is free time, unless they are specifically fixed for another day.
+    return true;
+  });
+
+  const fixedTasks = validTasks.filter(t => t.isFixed && t.fixedStartTime && t.fixedEndTime);
+  const flexibleTasks = validTasks.filter(t => !t.isFixed);
 
   for (const task of fixedTasks) {
-    const start = parseTimeString(task.fixedStartTime!, baseDate, config.timezone);
-    const end = parseTimeString(task.fixedEndTime!, baseDate, config.timezone);
+    const start = parseTimeString(task.fixedStartTime!, targetDate, config.timezone);
+    const end = parseTimeString(task.fixedEndTime!, targetDate, config.timezone);
     occupiedSlots.push({ start, end });
     entries.push({
       taskId: task._id,

@@ -8,14 +8,24 @@ export function nowInTimezone(timezone: string): Date {
   return toZonedTime(new Date(), timezone);
 }
 
-/**
- * Parse a time string (HH:mm) into a Date object for a given date and timezone.
- */
-export function parseTimeString(timeStr: string, date: Date, timezone: string): Date {
-  const [hours, minutes] = timeStr.split(':').map(Number);
-  const zonedDate = toZonedTime(date, timezone);
-  const start = startOfDay(zonedDate);
-  return addMinutes(setMinutes(setHours(start, hours!), minutes!), 0);
+export function parseTimeString(timeStr: string, date: Date | string, timezone: string): Date {
+  let yyyy, MM, dd;
+  
+  if (typeof date === 'string') {
+    [yyyy, MM, dd] = date.split('-');
+  } else {
+    const zonedDate = toZonedTime(date, timezone);
+    yyyy = zonedDate.getFullYear();
+    MM = String(zonedDate.getMonth() + 1).padStart(2, '0');
+    dd = String(zonedDate.getDate()).padStart(2, '0');
+  }
+
+  const [hours, minutes] = timeStr.split(':');
+  const hh = String(hours).padStart(2, '0');
+  const mm = String(minutes).padStart(2, '0');
+
+  const isoString = `${yyyy}-${MM}-${dd}T${hh}:${mm}:00`;
+  return fromZonedTime(isoString, timezone);
 }
 
 /**
