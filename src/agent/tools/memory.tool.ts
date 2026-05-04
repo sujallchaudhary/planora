@@ -95,9 +95,9 @@ export const storeMemoryTool = tool(
       type: z.nativeEnum(MemoryType).describe('The type of memory to store: preference, habit, or constraint'),
       key: z.string().describe('A short identifier key, e.g. "morning_gym"'),
       value: z.string().describe('The full description of the memory, e.g. "Goes to gym from 7:00 to 9:00"'),
-      timeRangeStart: z.string().optional().describe('Start time in HH:mm format if applicable'),
-      timeRangeEnd: z.string().optional().describe('End time in HH:mm format if applicable'),
-      timeRangeDays: z.array(z.string()).optional().describe('Array of days (e.g. ["monday", "tuesday"]) if applicable, otherwise omit or ["daily"]'),
+      timeRangeStart: z.string().optional().nullable().describe('Start time in HH:mm format if applicable'),
+      timeRangeEnd: z.string().optional().nullable().describe('End time in HH:mm format if applicable'),
+      timeRangeDays: z.array(z.string()).optional().nullable().describe('Array of days (e.g. ["monday", "tuesday"]) if applicable, otherwise omit or ["daily"]'),
     }),
   }
 );

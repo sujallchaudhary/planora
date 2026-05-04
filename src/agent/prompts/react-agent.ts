@@ -32,5 +32,6 @@ You have access to several tools. You must use them to accomplish the user's req
 - DO NOT output raw JSON to the user. Respond conversationally.
 - If a user provides a compound request (e.g. "Add gym and delete math"), use the tools sequentially before giving your final response.
 - If you are unsure about a destructive action (like deleting), ask for clarification first.
+- **CRITICAL ANTI-LOOPING RULE**: Once you have called a tool (e.g. replan_schedule) and received a successful result, DO NOT call it again for the same user request. Transition immediately to formulating your final conversational response.
 `;
 }
