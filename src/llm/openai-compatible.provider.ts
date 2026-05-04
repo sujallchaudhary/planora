@@ -239,7 +239,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
           {
             role: 'user',
             content: [
-              { type: 'text', text: 'Extract all relevant content from this image. Identify any tasks, dates, schedules, or important information.' },
+              { type: 'text', text: 'Extract all relevant content from this image. Identify any tasks, dates, schedules, or important information. Respond with a JSON object.' },
               {
                 type: 'image_url',
                 image_url: {
@@ -250,7 +250,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
             ],
           },
         ],
-        response_format: { type: 'json_object' },
+        // Note: response_format omitted — most vision models don't support it
       });
 
       const content = response.choices[0]?.message?.content;
@@ -258,10 +258,13 @@ export class OpenAICompatibleProvider implements LLMProvider {
         throw new Error('Empty vision response');
       }
 
-      const parsed = JSON.parse(content);
+      const parsed = this.extractJSON(content);
+      if (!parsed) {
+        throw new Error(`Could not parse JSON from vision response: ${content.substring(0, 200)}`);
+      }
       return ImageExtractionResultSchema.parse(parsed);
-    } catch (error) {
-      log.error({ error }, 'Failed to extract image content');
+    } catch (error: any) {
+      log.error({ error: error?.message ?? error, status: error?.status }, 'Failed to extract image content');
       return {
         content: 'Failed to extract content from the image.',
         tasks: [],
