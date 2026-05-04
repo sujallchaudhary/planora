@@ -12,7 +12,7 @@ export const ClassificationResultSchema = z.object({
     description: z.string().nullish().default(''),
     priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
     cognitiveLoad: z.nativeEnum(CognitiveLoad).nullish().default(CognitiveLoad.MEDIUM),
-    estimatedMinutes: z.number().positive().nullish().default(30),
+    estimatedMinutes: z.number().min(5).nullish().default(30),
     dueDate: z.string().nullish(),
     preferredTime: z.string().nullish(),
     tags: z.array(z.string()).nullish().default([]),
@@ -40,6 +40,9 @@ export const ClassificationResultSchema = z.object({
   // For REPLAN — reason/context
   replanContext: z.string().nullish(),
 
+  // For REPLAN / SHOW_PLAN — specific date (YYYY-MM-DD) if user asked for "tomorrow", "Friday", etc.
+  targetDate: z.string().nullish(),
+
   // Secondary intents for compound messages (e.g. "add gym and delete math")
   secondaryIntents: z.array(z.object({
     intent: z.nativeEnum(IntentType),
@@ -48,7 +51,7 @@ export const ClassificationResultSchema = z.object({
       description: z.string().nullish().default(''),
       priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
       cognitiveLoad: z.nativeEnum(CognitiveLoad).nullish().default(CognitiveLoad.MEDIUM),
-      estimatedMinutes: z.number().positive().nullish().default(30),
+      estimatedMinutes: z.number().min(5).nullish().default(30),
       dueDate: z.string().nullish(),
       preferredTime: z.string().nullish(),
       tags: z.array(z.string()).nullish().default([]),
@@ -58,6 +61,7 @@ export const ClassificationResultSchema = z.object({
     })).default([]),
     taskReference: z.string().nullish(),
     replanContext: z.string().nullish(),
+    targetDate: z.string().nullish(),
   })).default([]),
 
   // Raw reasoning from LLM
@@ -73,7 +77,7 @@ export const ImageExtractionResultSchema = z.object({
     title: z.string(),
     description: z.string().nullish().default(''),
     priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
-    estimatedMinutes: z.number().positive().nullish().default(30),
+    estimatedMinutes: z.number().min(5).nullish().default(30),
     dueDate: z.string().nullish(),
     fixedStartTime: z.string().nullish(),
     fixedEndTime: z.string().nullish(),
@@ -92,3 +96,16 @@ export const ResponseGenerationSchema = z.object({
 });
 
 export type ResponseGeneration = z.infer<typeof ResponseGenerationSchema>;
+
+// ─── Schedule Blueprint Generation ──────────────────────────────────────────────
+export const ScheduleBlueprintSchema = z.object({
+  tasks: z.array(z.object({
+    taskId: z.string(),
+    assignedBlock: z.enum(['morning', 'afternoon', 'evening', 'any']),
+    reasoning: z.string(),
+  })),
+  globalReasoning: z.string(),
+});
+
+export type ScheduleBlueprint = z.infer<typeof ScheduleBlueprintSchema>;
+

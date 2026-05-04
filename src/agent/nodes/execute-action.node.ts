@@ -75,6 +75,8 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         message: `Added ${created.length} task(s)`,
         data: { tasks: created.map(t => ({ id: t._id, title: t.title, priority: t.priority })) },
       };
+      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      result.message += ' and updated your schedule.';
       break;
     }
 
@@ -101,6 +103,8 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       }
       await taskRepo.updateTask(task._id!.toString(), updates);
       result = { success: true, action: 'modify_task', message: `Updated task "${task.title}"` };
+      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      result.message += ' and updated your schedule.';
       break;
     }
 
@@ -117,6 +121,8 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       }
       await taskRepo.deleteTask(matches[0]!._id!.toString());
       result = { success: true, action: 'delete_task', message: `Deleted task "${matches[0]!.title}"` };
+      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      result.message += ' and updated your schedule.';
       break;
     }
 
@@ -178,6 +184,10 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         action: 'complete_task',
         message: found ? `Marked "${taskTitle}" as completed ✅` : 'I couldn\'t find that task in your schedule. Try /schedule to see your tasks.',
       };
+      if (found) {
+        await triggerReplan(state.telegramId, user._id.toString(), config, today);
+        result.message += ' and updated your schedule.';
+      }
       break;
     }
 
@@ -225,26 +235,31 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
     }
 
     case IntentType.REPLAN: {
-      const newEntries = await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      const replanDate = state.intent.targetDate ?? today;
+      const newEntries = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate);
+      const dateLabel = replanDate === today ? 'your day' : replanDate;
       result = {
         success: true,
         action: 'replan',
-        message: `Replanned your day — ${newEntries} tasks scheduled`,
-        data: { scheduledCount: newEntries, reason: state.intent.replanContext },
+        message: `Replanned ${dateLabel} — ${newEntries} tasks scheduled`,
+        data: { scheduledCount: newEntries, reason: state.intent.replanContext, targetDate: replanDate },
       };
       break;
     }
 
     case IntentType.SHOW_PLAN: {
-      const schedule = await scheduleRepo.findByDate(state.telegramId, today);
+      const showDate = state.intent.targetDate ?? today;
+      const schedule = await scheduleRepo.findByDate(state.telegramId, showDate);
+      const dateLabel = showDate === today ? 'today' : showDate;
       if (!schedule || schedule.entries.length === 0) {
-        result = { success: true, action: 'show_plan', message: 'No schedule for today yet.', data: { entries: [] } };
+        result = { success: true, action: 'show_plan', message: `No schedule for ${dateLabel} yet. Say "plan ${dateLabel}" to create one.`, data: { entries: [], targetDate: showDate } };
       } else {
         result = {
           success: true,
           action: 'show_plan',
-          message: 'Here\'s your plan for today',
+          message: `Here's your plan for ${dateLabel}`,
           data: {
+            targetDate: showDate,
             entries: schedule.entries.map(e => ({
               title: e.title,
               startTime: e.startTime,

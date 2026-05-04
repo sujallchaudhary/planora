@@ -8,6 +8,7 @@ const envSchema = z.object({
   LLM_BASE_URL: z.string().url().default('https://api.openai.com/v1/'),
   LLM_API_KEY: z.string().min(1, 'LLM_API_KEY is required'),
   LLM_CHAT_MODEL: z.string().default('gpt-4o-mini'),
+  LLM_REASONING_MODEL: z.string().default('gpt-4o'),
   LLM_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
   LLM_MAX_TOKENS: z.coerce.number().positive().default(2048),
 

@@ -1,4 +1,7 @@
-import type { ClassificationResult, ImageExtractionResult } from '../utils/zod-schemas.js';
+import type { ClassificationResult, ImageExtractionResult, ScheduleBlueprint } from '../utils/zod-schemas.js';
+import type { ITask } from '../memory/mongo/models/task.model.js';
+import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
+import type { UserConfig } from '../config/config-resolver.js';
 
 export interface UserContext {
   telegramId: number;
@@ -13,6 +16,7 @@ export interface UserContext {
   /** True if current time is before the late-night threshold */
   isLateNight?: boolean;
   pendingTaskCount: number;
+  pendingTasksList?: string;
   hasScheduleToday: boolean;
   recentMemorySummary?: string;
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -50,4 +54,11 @@ export interface LLMProvider {
    * Generate an embedding vector for text.
    */
   getEmbedding(text: string): Promise<number[]>;
+
+  generateScheduleBlueprint(
+    tasks: ITask[],
+    memory: RetrievedMemory,
+    config: UserConfig,
+    targetDate: string
+  ): Promise<ScheduleBlueprint | null>;
 }

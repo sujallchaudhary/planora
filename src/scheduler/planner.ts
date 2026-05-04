@@ -7,6 +7,7 @@ import type { UserConfig } from '../config/config-resolver.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
 import { parseTimeString, formatDateString } from '../utils/date.js';
 import { findAvailableSlots, type TimeSlot, fitsInSlot } from './time-slots.js';
+import { getLLMProvider } from '../llm/openai-compatible.provider.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('planner');
@@ -99,6 +100,12 @@ export async function planSchedule(
 
   log.info({ targetDate, tasks: tasks.length, effectiveStart: effectiveStart.toISOString() }, 'Planning schedule');
 
+  // Request Schedule Blueprint from LLM
+  let blueprint = null;
+  if (tasks.length > 0) {
+    blueprint = await getLLMProvider().generateScheduleBlueprint(tasks, memory, config, targetDate);
+  }
+
   // Step 1: Lock fixed constraints
   const occupiedSlots: TimeSlot[] = [];
 
@@ -113,17 +120,21 @@ export async function planSchedule(
     if (isApplicable && constraint.isActive) {
       const start = parseTimeString(constraint.timeRange.start, targetDate, config.timezone);
       const end = parseTimeString(constraint.timeRange.end, targetDate, config.timezone);
-      occupiedSlots.push({ start, end });
-      entries.push({
-        title: prettyKey(constraint.key),
-        description: constraint.description,
-        startTime: start,
-        endTime: end,
-        status: ScheduleEntryStatus.SCHEDULED,
-        priority: 5,
-        isFixed: true,
-        flexibility: 0,
-      } as IScheduleEntry);
+      
+      const isAllDay = constraint.timeRange.start === '00:00' && constraint.timeRange.end === '23:59';
+      if (!isAllDay) {
+        occupiedSlots.push({ start, end });
+        entries.push({
+          title: prettyKey(constraint.key),
+          description: constraint.description,
+          startTime: start,
+          endTime: end,
+          status: ScheduleEntryStatus.SCHEDULED,
+          priority: 5,
+          isFixed: true,
+          flexibility: 0,
+        } as IScheduleEntry);
+      }
     }
   }
 
@@ -135,17 +146,21 @@ export async function planSchedule(
     if (isApplicable && habit.isActive) {
       const start = parseTimeString(habit.timeRange.start, targetDate, config.timezone);
       const end = parseTimeString(habit.timeRange.end, targetDate, config.timezone);
-      occupiedSlots.push({ start, end });
-      entries.push({
-        title: prettyKey(habit.key),
-        description: habit.description,
-        startTime: start,
-        endTime: end,
-        status: ScheduleEntryStatus.SCHEDULED,
-        priority: 3,
-        isFixed: false,
-        flexibility: 0.3,
-      } as IScheduleEntry);
+      
+      const isAllDay = habit.timeRange.start === '00:00' && habit.timeRange.end === '23:59';
+      if (!isAllDay) {
+        occupiedSlots.push({ start, end });
+        entries.push({
+          title: prettyKey(habit.key),
+          description: habit.description,
+          startTime: start,
+          endTime: end,
+          status: ScheduleEntryStatus.SCHEDULED,
+          priority: 3,
+          isFixed: false,
+          flexibility: 0.3,
+        } as IScheduleEntry);
+      }
     }
   }
 
@@ -170,22 +185,32 @@ export async function planSchedule(
   for (const task of fixedTasks) {
     const start = parseTimeString(task.fixedStartTime!, targetDate, config.timezone);
     const end = parseTimeString(task.fixedEndTime!, targetDate, config.timezone);
-    occupiedSlots.push({ start, end });
-    entries.push({
-      taskId: task._id,
-      title: task.title,
-      description: task.description,
-      startTime: start,
-      endTime: end,
-      status: ScheduleEntryStatus.SCHEDULED,
-      priority: task.priority,
-      isFixed: true,
-      flexibility: 0,
-    } as IScheduleEntry);
+    
+    const isAllDay = task.fixedStartTime === '00:00' && task.fixedEndTime === '23:59';
+    if (!isAllDay) {
+      occupiedSlots.push({ start, end });
+      entries.push({
+        taskId: task._id,
+        title: task.title,
+        description: task.description,
+        startTime: start,
+        endTime: end,
+        status: ScheduleEntryStatus.SCHEDULED,
+        priority: task.priority,
+        isFixed: true,
+        flexibility: 0,
+      } as IScheduleEntry);
+    }
   }
 
-  // Step 4: Sort flexible tasks by score (highest first)
-  const scoredTasks = flexibleTasks.map(t => ({ task: t, score: scoreTask(t) }));
+  // Step 4: Sort flexible tasks
+  // Use AI blueprint order if available, otherwise fallback to score
+  const scoredTasks = flexibleTasks.map(t => {
+    const blueprintTask = blueprint?.tasks.find(bt => bt.taskId === t._id?.toString());
+    // Give blueprint tasks higher base priority to ensure they are scheduled first in the order the AI provided
+    const blueprintScore = blueprintTask ? 1000 - blueprint.tasks.indexOf(blueprintTask) : 0;
+    return { task: t, score: blueprintScore > 0 ? blueprintScore : scoreTask(t), blueprint: blueprintTask };
+  });
   scoredTasks.sort((a, b) => b.score - a.score);
 
   // Calculate slack time to leave
@@ -195,7 +220,8 @@ export async function planSchedule(
   const maxFlexMinutes = totalWorkingMinutes - slackMinutes;
 
   // Step 5: Allocate flexible tasks into available slots
-  for (const { task } of scoredTasks) {
+  for (const taskData of scoredTasks) {
+    const { task } = taskData;
     if (allocatedFlexMinutes >= maxFlexMinutes) {
       log.debug({ task: task.title }, 'Slack limit reached, skipping task');
       break;
@@ -208,7 +234,26 @@ export async function planSchedule(
     }));
 
     const availableSlots = findAvailableSlots(bufferedSlots, effectiveStart, workingEnd, task.estimatedMinutes);
-    const preferred = getPreferredWindow(task, memory, effectiveStart, workingEnd);
+    
+    // Determine preferred window
+    let preferred = getPreferredWindow(task, memory, effectiveStart, workingEnd);
+    
+    // Override with AI blueprint if available
+    if (taskData.blueprint && taskData.blueprint.assignedBlock !== 'any') {
+      const startHour = taskData.blueprint.assignedBlock === 'morning' ? 0 : taskData.blueprint.assignedBlock === 'afternoon' ? 12 : 17;
+      const endHour = taskData.blueprint.assignedBlock === 'morning' ? 12 : taskData.blueprint.assignedBlock === 'afternoon' ? 17 : 24;
+      
+      const blockStart = new Date(workingStart);
+      blockStart.setHours(startHour, 0, 0, 0);
+      const blockEnd = new Date(workingStart);
+      blockEnd.setHours(endHour, 0, 0, 0);
+      
+      // Constrain within actual working hours
+      preferred = {
+        idealStart: blockStart > workingStart ? blockStart : workingStart,
+        idealEnd: blockEnd < workingEnd ? blockEnd : workingEnd,
+      };
+    }
 
     // Try to find a slot in the preferred window first
     let bestSlot: TimeSlot | null = null;

@@ -23,6 +23,7 @@ export async function generateResponseNode(state: AgentState): Promise<Partial<A
     currentTime: formatTime(now, config.timezone),
     currentDate: formatDateString(now, config.timezone),
     pendingTaskCount: await taskRepo.countPendingTasks(state.telegramId),
+    pendingTasksList: (await taskRepo.findPendingTasks(state.telegramId)).map(t => `- ${t.title}`).join('\n'),
     hasScheduleToday: !!(await scheduleRepo.findByDate(state.telegramId, todayString(config.timezone))),
     // Pass retrieved memory so LLM can answer personal questions
     recentMemorySummary: buildMemorySummary(state),

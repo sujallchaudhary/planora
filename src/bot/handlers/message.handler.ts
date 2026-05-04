@@ -17,6 +17,11 @@ export function registerMessageHandler(bot: any): void {
 
     log.info({ telegramId: from.id, text: text.substring(0, 50) }, 'Received text message');
 
+    let inputText = text;
+    if (ctx.message?.reply_to_message && ctx.message.reply_to_message.text) {
+      inputText = `[Replying to your message: "${ctx.message.reply_to_message.text.substring(0, 100)}..."]\n${text}`;
+    }
+
     // Ensure user exists
     const user = await userRepo.createOrUpdate(from.id, {
       firstName: from.first_name,
@@ -25,14 +30,14 @@ export function registerMessageHandler(bot: any): void {
     });
 
     // Save user message to history BEFORE running agent (so it's available to classify)
-    appendHistory(from.id, 'user', text);
+    appendHistory(from.id, 'user', inputText);
 
     try {
       const response = await runAgent({
         userId: user._id.toString(),
         telegramId: from.id,
         chatId: ctx.chat!.id,
-        rawInput: text,
+        rawInput: inputText,
       });
 
       // Save bot response so next message has full context

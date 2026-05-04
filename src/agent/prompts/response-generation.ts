@@ -12,6 +12,7 @@ export function RESPONSE_GENERATION_PROMPT(context: UserContext): string {
 - Current Time: ${context.currentTime}
 - Current Date: ${context.currentDate}
 - Pending Tasks: ${context.pendingTaskCount}
+${context.pendingTasksList ? `- Pending Tasks List:\n${context.pendingTasksList}` : ''}
 - Has Schedule Today: ${context.hasScheduleToday}
 ${memorySection}
 ## CRITICAL RULES — READ CAREFULLY

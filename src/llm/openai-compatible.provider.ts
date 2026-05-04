@@ -4,13 +4,19 @@ import type { LLMProvider, UserContext, ActionResult } from './provider.js';
 import {
   ClassificationResultSchema,
   ImageExtractionResultSchema,
+  ScheduleBlueprintSchema,
   type ClassificationResult,
   type ImageExtractionResult,
+  type ScheduleBlueprint,
 } from '../utils/zod-schemas.js';
+import type { ITask } from '../memory/mongo/models/task.model.js';
+import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
+import type { UserConfig } from '../config/config-resolver.js';
 import { IntentType } from '../config/defaults.js';
 import { INTENT_CLASSIFICATION_PROMPT } from '../agent/prompts/intent-classification.js';
 import { RESPONSE_GENERATION_PROMPT } from '../agent/prompts/response-generation.js';
 import { IMAGE_EXTRACTION_PROMPT } from '../agent/prompts/image-extraction.js';
+import { SCHEDULE_BLUEPRINT_PROMPT } from '../agent/prompts/schedule-blueprint.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('llm-openai');
@@ -20,6 +26,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
   private visionClient: OpenAI;
   private embeddingClient: OpenAI;
   private chatModel: string;
+  private reasoningModel: string;
   private visionModel: string;
   private embeddingModel: string;
   private temperature: number;
@@ -45,6 +52,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     });
 
     this.chatModel = env.LLM_CHAT_MODEL;
+    this.reasoningModel = env.LLM_REASONING_MODEL;
     this.visionModel = env.LLM_VISION_MODEL;
     this.embeddingModel = env.LLM_EMBEDDING_MODEL;
     this.temperature = env.LLM_TEMPERATURE;
@@ -55,6 +63,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       visionBaseURL: env.VISION_BASE_URL || env.LLM_BASE_URL,
       embeddingBaseURL: env.EMBEDDING_BASE_URL || env.LLM_BASE_URL,
       chatModel: this.chatModel,
+      reasoningModel: this.reasoningModel,
       visionModel: this.visionModel,
       embeddingModel: this.embeddingModel,
     }, 'Initialized OpenAI-compatible LLM provider (multi-endpoint)');
@@ -65,7 +74,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
 
     try {
       const response = await this.chatClient.chat.completions.create({
-        model: this.chatModel,
+        model: this.reasoningModel,
         temperature: this.temperature,
         max_tokens: this.maxTokens,
         messages: [
@@ -115,7 +124,10 @@ export class OpenAICompatibleProvider implements LLMProvider {
       return {
         intent: parsed.intent ?? IntentType.GENERAL_CHAT,
         confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
-        tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+        tasks: Array.isArray(parsed.tasks) ? parsed.tasks.map((t: any) => ({
+          ...t,
+          estimatedMinutes: typeof t.estimatedMinutes === 'number' ? Math.max(5, t.estimatedMinutes) : 30
+        })) : [],
         memorySignals,
         taskReference: typeof parsed.taskReference === 'string' ? parsed.taskReference : undefined,
         replanContext: typeof replanContext === 'string' ? replanContext : undefined,
@@ -287,6 +299,42 @@ export class OpenAICompatibleProvider implements LLMProvider {
     } catch (error) {
       log.error({ error }, 'Failed to generate embedding');
       throw error;
+    }
+  }
+
+  async generateScheduleBlueprint(
+    tasks: ITask[],
+    memory: RetrievedMemory,
+    config: UserConfig,
+    targetDate: string
+  ): Promise<ScheduleBlueprint | null> {
+    const systemPrompt = SCHEDULE_BLUEPRINT_PROMPT(tasks, memory, config, targetDate);
+
+    try {
+      const response = await this.chatClient.chat.completions.create({
+        model: this.reasoningModel,
+        temperature: this.temperature,
+        max_tokens: this.maxTokens,
+        messages: [{ role: 'system', content: systemPrompt }],
+        response_format: { type: 'json_object' },
+      });
+
+      const content = response.choices[0]?.message?.content;
+      if (!content) return null;
+
+      const parsed = this.extractJSON(content);
+      if (!parsed) return null;
+
+      const result = ScheduleBlueprintSchema.safeParse(parsed);
+      if (result.success) {
+        log.info({ tasksCount: result.data.tasks.length }, 'Generated schedule blueprint');
+        return result.data;
+      }
+      log.warn({ errors: result.error.issues }, 'Zod validation failed for blueprint');
+      return null;
+    } catch (error) {
+      log.error({ error }, 'Failed to generate schedule blueprint');
+      return null;
     }
   }
 }
