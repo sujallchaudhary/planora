@@ -48,7 +48,7 @@ export const replanScheduleTool = tool(
       const schedule = await scheduleRepo.createOrReplace(telegramId, user._id, today, newEntries);
       await syncReminders(telegramId, today, schedule.entries);
 
-      return `Successfully replanned schedule. ${newEntries.length} tasks scheduled for today.`;
+      return `Successfully replanned schedule. ${newEntries.length} tasks scheduled for today. [ACTION COMPLETE: DO NOT CALL THIS TOOL AGAIN. RESPOND TO THE USER DIRECTLY.]`;
     } catch (error: any) {
       return `Failed to replan schedule: ${error.message}`;
     }
@@ -56,7 +56,9 @@ export const replanScheduleTool = tool(
   {
     name: 'replan_schedule',
     description: 'Use this tool to trigger a replanning of the day\'s schedule. Call this after adding, skipping, or completing tasks if the user asks to replan.',
-    schema: z.object({}), // No arguments needed
+    schema: z.object({
+      _dummy: z.string().optional().nullable().describe('Ignore this parameter.'),
+    }),
   }
 );
 
@@ -90,6 +92,8 @@ export const getScheduleTool = tool(
   {
     name: 'get_schedule',
     description: 'Use this tool to get the user\'s current schedule for today.',
-    schema: z.object({}), // No arguments needed
+    schema: z.object({
+      _dummy: z.string().optional().nullable().describe('Ignore this parameter.'),
+    }),
   }
 );
