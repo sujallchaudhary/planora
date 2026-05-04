@@ -25,21 +25,13 @@ export interface ActionResult {
   data?: Record<string, unknown>;
 }
 
+import { ChatOpenAI } from '@langchain/openai';
+
 export interface LLMProvider {
   /**
-   * Single LLM call: classify intent + extract tasks + extract memory signals.
+   * Get the LangChain model for the ReAct agent.
    */
-  classifyAndExtract(input: string, context: UserContext): Promise<ClassificationResult>;
-
-  /**
-   * Generate a natural language response based on the action result and context.
-   */
-  generateResponse(
-    input: string,
-    classification: ClassificationResult,
-    result: ActionResult,
-    context: UserContext,
-  ): Promise<string>;
+  getLangChainModel(): ChatOpenAI;
 
   /**
    * Extract content from an image (base64 encoded).

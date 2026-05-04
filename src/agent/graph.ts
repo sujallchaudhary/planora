@@ -1,59 +1,28 @@
-import { StateGraph, END, START } from '@langchain/langgraph';
-import { AgentStateAnnotation, type AgentState } from './state.js';
-import { classifyIntentNode } from './nodes/classify-intent.node.js';
-import { extractMemoryNode } from './nodes/extract-memory.node.js';
-import { retrieveMemoryNode } from './nodes/retrieve-memory.node.js';
-import { executeActionNode } from './nodes/execute-action.node.js';
-import { generateResponseNode } from './nodes/generate-response.node.js';
-import { IntentType } from '../config/defaults.js';
+import { createReactAgent } from '@langchain/langgraph/prebuilt';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { getLLMProvider } from '../llm/openai-compatible.provider.js';
+import { agentTools } from './tools/index.js';
 import { createChildLogger } from '../utils/logger.js';
+import { userRepo } from '../memory/mongo/repositories/user.repo.js';
+import { buildReActSystemPrompt } from './prompts/react-agent.js';
+import { resolveUserConfig } from '../config/config-resolver.js';
+import { formatTimeHuman, formatDateString, planningDateString, tomorrowString } from '../utils/date.js';
 
 const log = createChildLogger('agent-graph');
 
-function routeByIntent(state: AgentState): string {
-  const intent = state.intent?.intent;
+let compiledGraph: any = null;
 
-  if (intent === IntentType.GENERAL_CHAT) {
-    return 'generate-response';
-  }
-
-  return 'execute-action';
-}
-
-function buildGraph() {
-  const graph = new StateGraph(AgentStateAnnotation)
-    .addNode('classify-intent', classifyIntentNode)
-    .addNode('extract-memory', extractMemoryNode)
-    .addNode('retrieve-memory', retrieveMemoryNode)
-    .addNode('execute-action', executeActionNode)
-    .addNode('generate-response', generateResponseNode)
-
-    // Flow: START → classify → extract-memory → retrieve-memory → (route) → ...
-    .addEdge(START, 'classify-intent')
-    .addEdge('classify-intent', 'extract-memory')
-    .addEdge('extract-memory', 'retrieve-memory')
-
-    // Conditional routing after memory retrieval
-    .addConditionalEdges('retrieve-memory', routeByIntent, {
-      'execute-action': 'execute-action',
-      'generate-response': 'generate-response',
-    })
-
-    // After execution, generate response
-    .addEdge('execute-action', 'generate-response')
-
-    // Response is the final node
-    .addEdge('generate-response', END);
-
-  return graph.compile();
-}
-
-let compiledGraph: ReturnType<typeof buildGraph> | null = null;
-
-export function getAgentGraph() {
+export function getAgentGraph(): any {
   if (!compiledGraph) {
-    compiledGraph = buildGraph();
-    log.info('Agent graph compiled');
+    const llmProvider = getLLMProvider();
+    const llm = llmProvider.getLangChainModel();
+    
+    // Create the ReAct agent
+    compiledGraph = createReactAgent({
+      llm,
+      tools: agentTools,
+    });
+    log.info('ReAct Agent graph compiled');
   }
   return compiledGraph;
 }
@@ -67,15 +36,60 @@ export async function runAgent(input: {
   imageMimeType?: string;
 }): Promise<string> {
   const graph = getAgentGraph();
+  const llmProvider = getLLMProvider();
 
-  const result = await graph.invoke({
-    userId: input.userId,
-    telegramId: input.telegramId,
-    chatId: input.chatId,
-    rawInput: input.rawInput,
-    imageBase64: input.imageBase64,
-    imageMimeType: input.imageMimeType,
+  let finalInputText = input.rawInput;
+
+  // Process image before starting the ReAct loop
+  if (input.imageBase64 && input.imageMimeType) {
+    log.info('Extracting image context before ReAct loop');
+    const imageResult = await llmProvider.extractImageContent(input.imageBase64, input.imageMimeType);
+    
+    let imageInfo = `\n[System: The user also attached an image. Extracted context: "${imageResult.content}"]`;
+    if (imageResult.tasks && imageResult.tasks.length > 0) {
+      imageInfo += `\nExtracted tasks from image: ${JSON.stringify(imageResult.tasks)}`;
+    }
+    finalInputText += imageInfo;
+  }
+
+  const user = await userRepo.findByTelegramId(input.telegramId);
+  const userName = user ? user.firstName : 'User';
+
+  const config = resolveUserConfig(user?.settings);
+  const tz = config.timezone;
+  const now = new Date();
+
+  const promptText = buildReActSystemPrompt({
+    userName,
+    currentTime: formatTimeHuman(now, tz),
+    currentDate: formatDateString(now, tz),
+    timezone: tz,
+    planningDate: planningDateString(tz, config.lateNightThresholdHour),
+    tomorrowDate: tomorrowString(tz, config.lateNightThresholdHour),
   });
 
-  return result.response || 'I processed your message but couldn\'t generate a response.';
+  const systemMessage = new SystemMessage(promptText);
+
+  const userMessage = new HumanMessage(finalInputText);
+
+  // Invoke the graph
+  const result = await graph.invoke(
+    {
+      messages: [systemMessage, userMessage],
+    },
+    {
+      configurable: {
+        telegramId: input.telegramId,
+      },
+    }
+  );
+
+  const messages = result.messages;
+  const lastMessage = messages[messages.length - 1];
+
+  if (lastMessage?.content) {
+    return lastMessage.content as string;
+  }
+
+  return 'I processed your message but couldn\'t generate a response.';
 }

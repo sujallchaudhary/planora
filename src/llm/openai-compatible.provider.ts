@@ -1,15 +1,11 @@
 import OpenAI from 'openai';
+import { ChatOpenAI } from '@langchain/openai';
 import { env } from '../config/env.js';
-import type { LLMProvider, UserContext, ActionResult } from './provider.js';
+import type { LLMProvider } from './provider.js';
 import {
-  ClassificationResultSchema,
   ImageExtractionResultSchema,
-  type ClassificationResult,
   type ImageExtractionResult,
 } from '../utils/zod-schemas.js';
-import { IntentType } from '../config/defaults.js';
-import { INTENT_CLASSIFICATION_PROMPT } from '../agent/prompts/intent-classification.js';
-import { RESPONSE_GENERATION_PROMPT } from '../agent/prompts/response-generation.js';
 import { IMAGE_EXTRACTION_PROMPT } from '../agent/prompts/image-extraction.js';
 import { createChildLogger } from '../utils/logger.js';
 
@@ -60,80 +56,16 @@ export class OpenAICompatibleProvider implements LLMProvider {
     }, 'Initialized OpenAI-compatible LLM provider (multi-endpoint)');
   }
 
-  async classifyAndExtract(input: string, context: UserContext): Promise<ClassificationResult> {
-    const systemPrompt = INTENT_CLASSIFICATION_PROMPT(context);
-
-    try {
-      const response = await this.chatClient.chat.completions.create({
-        model: this.chatModel,
-        temperature: this.temperature,
-        max_tokens: this.maxTokens,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          // Inject last few turns so model has follow-up context
-          ...(context.conversationHistory ?? []),
-          { role: 'user', content: input },
-        ],
-        response_format: { type: 'json_object' },
-      });
-
-      const content = response.choices[0]?.message?.content;
-      if (!content) {
-        throw new Error('Empty LLM response');
-      }
-
-      // Robust JSON extraction — handles markdown-wrapped responses
-      const parsed = this.extractJSON(content);
-      log.info({ rawContent: content.substring(0, 500), parsedKeys: parsed ? Object.keys(parsed) : null }, 'LLM raw classification response');
-
-      if (!parsed) {
-        throw new Error(`Failed to parse JSON from LLM response: ${content.substring(0, 200)}`);
-      }
-
-      // Use safeParse for lenient validation
-      const result = ClassificationResultSchema.safeParse(parsed);
-      if (result.success) {
-        log.info({ intent: result.data.intent, confidence: result.data.confidence }, 'Classified intent');
-        return result.data;
-      }
-
-      // If validation fails, try to salvage what we can
-      log.warn({ errors: result.error.issues, parsedKeys: Object.keys(parsed) }, 'Zod validation failed, attempting salvage');
-
-      // Handle memorySignals being strings instead of objects
-      let memorySignals = parsed.memorySignals ?? parsed.memory_signals ?? [];
-      if (Array.isArray(memorySignals)) {
-        memorySignals = memorySignals.filter((s: unknown) => typeof s === 'object' && s !== null);
-      }
-
-      // Handle replanContext being an object instead of string
-      let replanContext = parsed.replanContext ?? parsed.replan_context;
-      if (typeof replanContext === 'object' && replanContext !== null) {
-        replanContext = JSON.stringify(replanContext);
-      }
-
-      return {
-        intent: parsed.intent ?? IntentType.GENERAL_CHAT,
-        confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
-        tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
-        memorySignals,
-        taskReference: typeof parsed.taskReference === 'string' ? parsed.taskReference : undefined,
-        replanContext: typeof replanContext === 'string' ? replanContext : undefined,
-        secondaryIntents: Array.isArray(parsed.secondaryIntents) ? parsed.secondaryIntents : [],
-        reasoning: parsed.reasoning,
-      };
-    } catch (error) {
-      log.error({ error, input: input.substring(0, 100) }, 'Failed to classify intent');
-      // Fallback to general chat on error
-      return {
-        intent: IntentType.GENERAL_CHAT,
-        confidence: 0.5,
-        tasks: [],
-        memorySignals: [],
-        secondaryIntents: [],
-        reasoning: 'Failed to classify — falling back to general chat',
-      };
-    }
+  getLangChainModel() {
+    return new ChatOpenAI({
+      modelName: this.chatModel,
+      temperature: this.temperature,
+      maxTokens: this.maxTokens,
+      configuration: {
+        baseURL: env.LLM_BASE_URL,
+        apiKey: env.LLM_API_KEY,
+      },
+    });
   }
 
   /**
@@ -187,45 +119,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
     }
 
     return null;
-  }
-
-  async generateResponse(
-    input: string,
-    classification: ClassificationResult,
-    result: ActionResult,
-    context: UserContext,
-  ): Promise<string> {
-    const systemPrompt = RESPONSE_GENERATION_PROMPT(context);
-
-    try {
-      const response = await this.chatClient.chat.completions.create({
-        model: this.chatModel,
-        temperature: this.temperature + 0.2,
-        max_tokens: this.maxTokens,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          // Inject last few turns for conversational context
-          ...(context.conversationHistory ?? []),
-          {
-            role: 'user',
-            content: JSON.stringify({
-              userInput: input,
-              intent: classification.intent,
-              actionResult: result,
-              extractedTasks: classification.tasks,
-            }),
-          },
-        ],
-      });
-
-      const content = response.choices[0]?.message?.content;
-      return content ?? 'I processed your request, but I couldn\'t formulate a response. Please try again.';
-    } catch (error) {
-      log.error({ error }, 'Failed to generate response');
-      return result.success
-        ? `✅ Done! ${result.message}`
-        : `❌ Something went wrong: ${result.message}`;
-    }
   }
 
   async extractImageContent(imageBase64: string, mimeType: string): Promise<ImageExtractionResult> {
