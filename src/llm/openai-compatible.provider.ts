@@ -135,27 +135,52 @@ export class OpenAICompatibleProvider implements LLMProvider {
   }
 
   /**
-   * Extract JSON from LLM response, handling markdown code fences and extra text.
+   * Extract JSON from LLM response, handling:
+   * - Markdown code fences
+   * - Duplicate keys (model looping on "reasoning")
+   * - Truncated JSON (max_tokens cut-off)
    */
   private extractJSON(text: string): Record<string, any> | null {
-    // Try direct parse first
+    // Step 1: Remove duplicate keys (keep first occurrence)
+    // The LLM sometimes loops: "reasoning":"x","reasoning":"x","reasoning":"x"...
+    let cleaned = text.replace(
+      /,\s*"reasoning"\s*:\s*"[^"]*"(?=\s*,\s*"reasoning")/g,
+      ''
+    );
+
+    // Step 2: Try direct parse
     try {
-      return JSON.parse(text);
+      return JSON.parse(cleaned);
     } catch { /* continue */ }
 
-    // Try extracting from markdown code fence
-    const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+    // Step 3: Try extracting from markdown code fence
+    const jsonMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
     if (jsonMatch?.[1]) {
       try {
         return JSON.parse(jsonMatch[1].trim());
       } catch { /* continue */ }
     }
 
-    // Try finding first { ... } block
-    const braceMatch = text.match(/\{[\s\S]*\}/);
+    // Step 4: Try finding first { ... } block
+    const braceMatch = cleaned.match(/\{[\s\S]*\}/);
     if (braceMatch) {
       try {
         return JSON.parse(braceMatch[0]);
+      } catch { /* continue */ }
+    }
+
+    // Step 5: Handle truncated JSON — find the opening { and try to close it
+    const openBrace = cleaned.indexOf('{');
+    if (openBrace >= 0) {
+      let truncated = cleaned.substring(openBrace);
+      // Remove trailing incomplete string/value (after last complete key-value)
+      truncated = truncated.replace(/,\s*"[^"]*"\s*:\s*"[^"]*$/, '');
+      // Close any unclosed structures
+      const openBraces = (truncated.match(/\{/g) || []).length;
+      const closeBraces = (truncated.match(/\}/g) || []).length;
+      truncated += '}'.repeat(Math.max(0, openBraces - closeBraces));
+      try {
+        return JSON.parse(truncated);
       } catch { /* continue */ }
     }
 

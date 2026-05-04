@@ -92,7 +92,12 @@ export async function planSchedule(
   const workingStart = parseTimeString(config.workingHours.start, targetDate, config.timezone);
   const workingEnd = parseTimeString(config.workingHours.end, targetDate, config.timezone);
 
-  log.info({ targetDate, tasks: tasks.length }, 'Planning schedule');
+  // Use the later of working hours start or current time for flexible task scheduling
+  // This prevents scheduling tasks in the past (e.g. at 11:41 AM, don't schedule at 8 AM)
+  const now = toZonedTime(new Date(), config.timezone);
+  const effectiveStart = now > workingStart ? now : workingStart;
+
+  log.info({ targetDate, tasks: tasks.length, effectiveStart: effectiveStart.toISOString() }, 'Planning schedule');
 
   // Step 1: Lock fixed constraints
   const occupiedSlots: TimeSlot[] = [];
@@ -184,7 +189,7 @@ export async function planSchedule(
   scoredTasks.sort((a, b) => b.score - a.score);
 
   // Calculate slack time to leave
-  const totalWorkingMinutes = (workingEnd.getTime() - workingStart.getTime()) / (60 * 1000);
+  const totalWorkingMinutes = (workingEnd.getTime() - effectiveStart.getTime()) / (60 * 1000);
   const slackMinutes = totalWorkingMinutes * (config.slackPercentage / 100);
   let allocatedFlexMinutes = 0;
   const maxFlexMinutes = totalWorkingMinutes - slackMinutes;
@@ -202,8 +207,8 @@ export async function planSchedule(
       end: addMinutes(s.end, config.bufferMinutes),
     }));
 
-    const availableSlots = findAvailableSlots(bufferedSlots, workingStart, workingEnd, task.estimatedMinutes);
-    const preferred = getPreferredWindow(task, memory, workingStart, workingEnd);
+    const availableSlots = findAvailableSlots(bufferedSlots, effectiveStart, workingEnd, task.estimatedMinutes);
+    const preferred = getPreferredWindow(task, memory, effectiveStart, workingEnd);
 
     // Try to find a slot in the preferred window first
     let bestSlot: TimeSlot | null = null;

@@ -5,6 +5,8 @@ import { preferenceRepo } from '../../memory/mongo/repositories/preference.repo.
 import { Habit } from '../../memory/mongo/models/habit.model.js';
 import { Constraint } from '../../memory/mongo/models/constraint.model.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
+import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
+import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('node:extract-memory');
@@ -18,6 +20,10 @@ export async function extractMemoryNode(state: AgentState): Promise<Partial<Agen
   if (!user) return {};
 
   const config = resolveUserConfig(user.settings);
+
+  // Prepare semantic memory for vector storage
+  const llm = getLLMProvider();
+  const semanticMemory = new SemanticMemory((t: string) => llm.getEmbedding(t));
 
   for (const signal of state.intent.memorySignals) {
     if (signal.confidence < config.memoryConfidenceThreshold) {
@@ -81,6 +87,24 @@ export async function extractMemoryNode(state: AgentState): Promise<Partial<Agen
           log.info({ key: signal.key }, 'Stored constraint');
           break;
       }
+
+      // Also store in Qdrant vector store for semantic retrieval
+      await semanticMemory.store({
+        userId: user._id.toString(),
+        telegramId: state.telegramId,
+        type: signal.type,
+        content: `${signal.key}: ${signal.value}`,
+        metadata: {
+          key: signal.key,
+          timeRange: signal.timeRange ?? null,
+          source: 'user_message',
+        },
+        timestamp: new Date().toISOString(),
+        confidence: signal.confidence,
+      }).catch(err => {
+        log.warn({ err: err?.message, key: signal.key }, 'Failed to store in vector DB — MongoDB entry is still saved');
+      });
+
     } catch (error) {
       log.error({ error, signal }, 'Failed to store memory signal');
     }

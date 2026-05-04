@@ -73,7 +73,10 @@ Each task in the "tasks" array should have:
 Priority: 1=LOW, 2=MEDIUM, 3=HIGH, 4=URGENT, 5=CRITICAL
 CognitiveLoad: 1=LOW, 2=MEDIUM, 3=HIGH
 
-## Memory Signals (when user reveals patterns)
+## Memory Signals — ALWAYS EXTRACT THESE
+⚠️ Memory signals are INDEPENDENT of intent. Even if the intent is GENERAL_CHAT, you MUST still extract any habits, preferences, or constraints mentioned in the message.
+Whenever the user reveals a pattern, preference, habit, or constraint — even casually — add it to memorySignals.
+
 Each signal in "memorySignals" array:
 {
   "type": "preference OR habit OR constraint",
@@ -82,6 +85,12 @@ Each signal in "memorySignals" array:
   "timeRange": { "start": "HH:mm", "end": "HH:mm", "days": ["monday"] },
   "confidence": 0.8
 }
+
+Examples of things to ALWAYS extract:
+- "I go to gym 7-9" → habit (morning_gym, "Gym from 7:00-9:00")
+- "I prefer studying at night" → preference (study_time, "Prefers studying at night")
+- "I have exams right now" → constraint (exam_period, "Currently in exam period")
+- "I don't eat before 12pm" → preference (intermittent_fasting, "No eating before 12pm")
 
 ## Examples
 
@@ -99,6 +108,9 @@ Response: {"intent": "COMPLETE_TASK", "confidence": 0.9, "tasks": [], "memorySig
 
 User: "yes please" (after bot said "Want me to add Quick catch-up with Ankit on May 9th?")
 Response: {"intent": "ADD_TASK", "confidence": 0.95, "tasks": [{"title": "Quick catch-up with Ankit", "description": "", "priority": 2, "cognitiveLoad": 1, "estimatedMinutes": 15, "dueDate": "2026-05-09", "preferredTime": "morning", "tags": [], "isFixed": true, "fixedStartTime": "10:15", "fixedEndTime": "10:30"}], "memorySignals": [], "taskReference": null, "replanContext": null, "reasoning": "User confirmed the task suggested by the bot in previous message"}
+
+User: "i usually prefer to go to gym in the morning 7-9 but rn my exams are going may skip the gym"
+Response: {"intent": "GENERAL_CHAT", "confidence": 0.85, "tasks": [], "memorySignals": [{"type": "habit", "key": "morning_gym", "value": "Gym from 7:00-9:00 in the morning", "timeRange": {"start": "07:00", "end": "09:00", "days": []}, "confidence": 0.9}, {"type": "preference", "key": "gym_preference", "value": "Prefers morning gym sessions", "timeRange": {"start": "07:00", "end": "09:00"}, "confidence": 0.85}, {"type": "constraint", "key": "exam_period", "value": "Currently in exam period, skipping gym temporarily", "timeRange": null, "confidence": 0.8}], "taskReference": null, "replanContext": null, "reasoning": "Conversational but reveals gym habit, morning preference, and exam constraint — all stored as memory signals"}
 
 CRITICAL: You MUST include "intent" and "confidence" as top-level keys. Do NOT wrap the response. Do NOT include a "thought" key. Return ONLY the JSON object.`;
 }
