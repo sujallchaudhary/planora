@@ -208,7 +208,7 @@ export async function planSchedule(
   const scoredTasks = flexibleTasks.map(t => {
     const blueprintTask = blueprint?.tasks.find(bt => bt.taskId === t._id?.toString());
     // Give blueprint tasks higher base priority to ensure they are scheduled first in the order the AI provided
-    const blueprintScore = blueprintTask ? 1000 - blueprint.tasks.indexOf(blueprintTask) : 0;
+    const blueprintScore = blueprintTask ? 1000 - blueprint!.tasks.indexOf(blueprintTask) : 0;
     return { task: t, score: blueprintScore > 0 ? blueprintScore : scoreTask(t), blueprint: blueprintTask };
   });
   scoredTasks.sort((a, b) => b.score - a.score);
