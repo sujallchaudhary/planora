@@ -305,6 +305,101 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       result = { success: true, action: 'general_chat', message: 'Chat response' };
   }
 
+  // Process secondary intents (compound messages like "add gym and delete math")
+  if (state.intent.secondaryIntents && state.intent.secondaryIntents.length > 0) {
+    const secondaryResults: string[] = [];
+    for (const secondary of state.intent.secondaryIntents) {
+      try {
+        let msg = '';
+        switch (secondary.intent) {
+          case IntentType.ADD_TASK: {
+            if (secondary.tasks.length > 0) {
+              for (const task of secondary.tasks) {
+                await taskRepo.create({
+                  userId: user._id,
+                  telegramId: state.telegramId,
+                  title: task.title,
+                  description: task.description ?? undefined,
+                  priority: task.priority ?? undefined,
+                  cognitiveLoad: task.cognitiveLoad ?? undefined,
+                  estimatedMinutes: task.estimatedMinutes ?? undefined,
+                  dueDate: task.dueDate ? new Date(task.dueDate) : undefined,
+                  preferredTime: task.preferredTime ?? undefined,
+                  tags: task.tags ?? undefined,
+                  isFixed: task.isFixed ?? undefined,
+                  fixedStartTime: task.fixedStartTime ?? undefined,
+                  fixedEndTime: task.fixedEndTime ?? undefined,
+                });
+              }
+              msg = `Added ${secondary.tasks.length} task(s): ${secondary.tasks.map(t => t.title).join(', ')}`;
+            }
+            break;
+          }
+          case IntentType.DELETE_TASK: {
+            if (secondary.taskReference) {
+              const matches = await taskRepo.findByTitle(state.telegramId, secondary.taskReference);
+              if (matches.length > 0) {
+                await taskRepo.deleteTask(matches[0]!._id!.toString());
+                msg = `Deleted "${matches[0]!.title}"`;
+              }
+            }
+            break;
+          }
+          case IntentType.MODIFY_TASK: {
+            if (secondary.taskReference) {
+              const matches = await taskRepo.findByTitle(state.telegramId, secondary.taskReference);
+              if (matches.length > 0 && secondary.tasks[0]) {
+                const t = secondary.tasks[0];
+                const updates: Record<string, unknown> = {};
+                if (t.title) updates.title = t.title;
+                if (t.description) updates.description = t.description;
+                if (t.priority) updates.priority = t.priority;
+                if (t.estimatedMinutes) updates.estimatedMinutes = t.estimatedMinutes;
+                if (t.preferredTime) updates.preferredTime = t.preferredTime;
+                await taskRepo.updateTask(matches[0]!._id!.toString(), updates);
+                msg = `Updated "${matches[0]!.title}"`;
+              }
+            }
+            break;
+          }
+          case IntentType.COMPLETE_TASK: {
+            if (secondary.taskReference) {
+              const schedule = await scheduleRepo.findByDate(state.telegramId, today);
+              if (schedule) {
+                const entry = schedule.entries.find(e =>
+                  e.title.toLowerCase().includes(secondary.taskReference!.toLowerCase())
+                );
+                if (entry) {
+                  entry.status = 'completed' as any;
+                  await schedule.save();
+                  msg = `Completed "${entry.title}"`;
+                }
+              }
+            }
+            break;
+          }
+          case IntentType.REPLAN: {
+            const count = await triggerReplan(state.telegramId, user._id.toString(), config, today);
+            msg = `Replanned — ${count} tasks scheduled`;
+            break;
+          }
+          default:
+            break;
+        }
+        if (msg) {
+          secondaryResults.push(msg);
+          log.info({ secondaryIntent: secondary.intent, msg }, 'Executed secondary intent');
+        }
+      } catch (err) {
+        log.error({ err, secondaryIntent: secondary.intent }, 'Secondary intent failed');
+      }
+    }
+
+    if (secondaryResults.length > 0) {
+      result.message += ' | ' + secondaryResults.join(' | ');
+    }
+  }
+
   return { actionResult: result };
 }
 

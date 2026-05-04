@@ -91,11 +91,22 @@ Examples of things to ALWAYS extract:
 - "I prefer studying at night" → preference (study_time, "Prefers studying at night")
 - "I have exams right now" → constraint (exam_period, "Currently in exam period")
 - "I don't eat before 12pm" → preference (intermittent_fasting, "No eating before 12pm")
+## Compound Messages — secondaryIntents
+If the user's message contains MULTIPLE distinct actions (e.g. "add gym and delete math" or "done with reading, now add cooking for 30 min"), use the PRIMARY intent for the most important action and put additional actions in "secondaryIntents".
+
+Each secondaryIntent has: { intent, tasks, taskReference, replanContext }
+Only use secondaryIntents when the message truly contains 2+ separate actions. Do NOT split a single action into multiple intents.
+
+Example: "add gym at 7am and delete the math task"
+→ intent: ADD_TASK, tasks: [{title: "Gym", ...}], secondaryIntents: [{intent: "DELETE_TASK", tasks: [], taskReference: "math"}]
+
+Example: "done with reading, also skip gym today"
+→ intent: COMPLETE_TASK, taskReference: "reading", secondaryIntents: [{intent: "SKIP_TASK", tasks: [], taskReference: "gym"}]
 
 ## Examples
 
 User: "hi"
-Response: {"intent": "GENERAL_CHAT", "confidence": 1.0, "tasks": [], "memorySignals": [], "taskReference": null, "replanContext": null, "reasoning": "Casual greeting"}
+Response: {"intent": "GENERAL_CHAT", "confidence": 1.0, "tasks": [], "memorySignals": [], "secondaryIntents": [], "taskReference": null, "replanContext": null, "reasoning": "Casual greeting"}
 
 User: "I need to study math for 2 hours"
 Response: {"intent": "ADD_TASK", "confidence": 0.95, "tasks": [{"title": "Study math", "description": "", "priority": 2, "cognitiveLoad": 3, "estimatedMinutes": 120, "dueDate": null, "preferredTime": null, "tags": ["study"], "isFixed": false, "fixedStartTime": null, "fixedEndTime": null}], "memorySignals": [], "taskReference": null, "replanContext": null, "reasoning": "User wants to add a study task"}

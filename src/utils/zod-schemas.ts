@@ -40,6 +40,26 @@ export const ClassificationResultSchema = z.object({
   // For REPLAN — reason/context
   replanContext: z.string().nullish(),
 
+  // Secondary intents for compound messages (e.g. "add gym and delete math")
+  secondaryIntents: z.array(z.object({
+    intent: z.nativeEnum(IntentType),
+    tasks: z.array(z.object({
+      title: z.string(),
+      description: z.string().nullish().default(''),
+      priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
+      cognitiveLoad: z.nativeEnum(CognitiveLoad).nullish().default(CognitiveLoad.MEDIUM),
+      estimatedMinutes: z.number().positive().nullish().default(30),
+      dueDate: z.string().nullish(),
+      preferredTime: z.string().nullish(),
+      tags: z.array(z.string()).nullish().default([]),
+      isFixed: z.boolean().nullish().default(false),
+      fixedStartTime: z.string().nullish(),
+      fixedEndTime: z.string().nullish(),
+    })).default([]),
+    taskReference: z.string().nullish(),
+    replanContext: z.string().nullish(),
+  })).default([]),
+
   // Raw reasoning from LLM
   reasoning: z.string().nullish(),
 });

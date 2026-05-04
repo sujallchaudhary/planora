@@ -119,6 +119,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         memorySignals,
         taskReference: typeof parsed.taskReference === 'string' ? parsed.taskReference : undefined,
         replanContext: typeof replanContext === 'string' ? replanContext : undefined,
+        secondaryIntents: Array.isArray(parsed.secondaryIntents) ? parsed.secondaryIntents : [],
         reasoning: parsed.reasoning,
       };
     } catch (error) {
@@ -129,6 +130,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         confidence: 0.5,
         tasks: [],
         memorySignals: [],
+        secondaryIntents: [],
         reasoning: 'Failed to classify — falling back to general chat',
       };
     }
@@ -235,22 +237,22 @@ export class OpenAICompatibleProvider implements LLMProvider {
         temperature: this.temperature,
         max_tokens: this.maxTokens,
         messages: [
-          { role: 'system', content: systemPrompt },
           {
             role: 'user',
             content: [
-              { type: 'text', text: 'Extract all relevant content from this image. Identify any tasks, dates, schedules, or important information. Respond with a JSON object.' },
+              {
+                type: 'text',
+                text: `${systemPrompt}\n\nExtract all relevant content from this image. Identify any tasks, dates, schedules, or important information. Respond with a JSON object only.`,
+              },
               {
                 type: 'image_url',
                 image_url: {
                   url: `data:${mimeType};base64,${imageBase64}`,
-                  detail: 'high',
                 },
               },
             ],
           },
         ],
-        // Note: response_format omitted — most vision models don't support it
       });
 
       const content = response.choices[0]?.message?.content;
@@ -264,7 +266,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
       }
       return ImageExtractionResultSchema.parse(parsed);
     } catch (error: any) {
-      log.error({ error: error?.message ?? error, status: error?.status }, 'Failed to extract image content');
+      const errBody = error?.error ?? error?.response?.data ?? error?.message ?? error;
+      log.error({ error: errBody, status: error?.status, model: this.visionModel }, 'Failed to extract image content');
       return {
         content: 'Failed to extract content from the image.',
         tasks: [],
