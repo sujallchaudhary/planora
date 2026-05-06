@@ -208,36 +208,54 @@ export class OpenAICompatibleProvider implements LLMProvider {
     context: UserContext,
   ): Promise<string> {
     const systemPrompt = RESPONSE_GENERATION_PROMPT(context);
+    const maxRetries = 2;
 
-    try {
-      const response = await this.chatClient.chat.completions.create({
-        model: this.chatModel,
-        temperature: this.temperature + 0.2,
-        max_tokens: this.maxTokens,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          // Inject last few turns for conversational context
-          ...(context.conversationHistory ?? []),
-          {
-            role: 'user',
-            content: JSON.stringify({
-              userInput: input,
-              intent: classification.intent,
-              actionResult: result,
-              extractedTasks: classification.tasks,
-            }),
-          },
-        ],
-      });
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await this.chatClient.chat.completions.create({
+          model: this.chatModel,
+          temperature: this.temperature + 0.2,
+          max_tokens: this.maxTokens,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            // Inject last few turns for conversational context
+            ...(context.conversationHistory ?? []),
+            {
+              role: 'user',
+              content: JSON.stringify({
+                userInput: input,
+                intent: classification.intent,
+                actionResult: result,
+                extractedTasks: classification.tasks,
+              }),
+            },
+          ],
+        });
 
-      const content = response.choices[0]?.message?.content;
-      return content ?? 'I processed your request, but I couldn\'t formulate a response. Please try again.';
-    } catch (error) {
-      log.error({ error }, 'Failed to generate response');
-      return result.success
-        ? `✅ Done! ${result.message}`
-        : `❌ Something went wrong: ${result.message}`;
+        const content = response.choices[0]?.message?.content;
+        return content ?? 'I processed your request, but I couldn\'t formulate a response. Please try again.';
+      } catch (error: any) {
+        const status = error?.status ?? error?.response?.status;
+        const isRetryable = status === 503 || status === 429 || status === 502;
+
+        if (isRetryable && attempt < maxRetries) {
+          const delay = 1000 * (attempt + 1);
+          log.warn({ status, attempt: attempt + 1, maxRetries, delayMs: delay }, 'Retryable error in generateResponse, retrying...');
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+
+        log.error({ error, attempt }, 'Failed to generate response');
+        return result.success
+          ? `✅ Done! ${result.message}`
+          : `❌ Something went wrong: ${result.message}`;
+      }
     }
+
+    // Should never reach here, but TypeScript safety
+    return result.success
+      ? `✅ Done! ${result.message}`
+      : `❌ Something went wrong: ${result.message}`;
   }
 
   async extractImageContent(imageBase64: string, mimeType: string): Promise<ImageExtractionResult> {

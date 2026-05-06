@@ -100,9 +100,12 @@ export async function planSchedule(
 
   log.info({ targetDate, tasks: tasks.length, effectiveStart: effectiveStart.toISOString() }, 'Planning schedule');
 
-  // Request Schedule Blueprint from LLM
+  // Guard: check if there's any working time left for flexible tasks
+  const hasTimeRemaining = effectiveStart < workingEnd;
+
+  // Request Schedule Blueprint from LLM — only if there are tasks AND time remaining
   let blueprint = null;
-  if (tasks.length > 0) {
+  if (tasks.length > 0 && hasTimeRemaining) {
     blueprint = await getLLMProvider().generateScheduleBlueprint(tasks, memory, config, targetDate);
   }
 
@@ -187,7 +190,9 @@ export async function planSchedule(
     const end = parseTimeString(task.fixedEndTime!, targetDate, config.timezone);
     
     const isAllDay = task.fixedStartTime === '00:00' && task.fixedEndTime === '23:59';
-    if (!isAllDay) {
+    const isPast = end <= now;
+    
+    if (!isAllDay && !isPast) {
       occupiedSlots.push({ start, end });
       entries.push({
         taskId: task._id,
@@ -200,6 +205,8 @@ export async function planSchedule(
         isFixed: true,
         flexibility: 0,
       } as IScheduleEntry);
+    } else if (isPast) {
+      log.debug({ task: task.title, end: end.toISOString() }, 'Skipping fixed task — already past');
     }
   }
 
@@ -214,13 +221,17 @@ export async function planSchedule(
   scoredTasks.sort((a, b) => b.score - a.score);
 
   // Calculate slack time to leave
-  const totalWorkingMinutes = (workingEnd.getTime() - effectiveStart.getTime()) / (60 * 1000);
+  const totalWorkingMinutes = hasTimeRemaining ? (workingEnd.getTime() - effectiveStart.getTime()) / (60 * 1000) : 0;
   const slackMinutes = totalWorkingMinutes * (config.slackPercentage / 100);
   let allocatedFlexMinutes = 0;
   const maxFlexMinutes = totalWorkingMinutes - slackMinutes;
 
-  // Step 5: Allocate flexible tasks into available slots
+  // Step 5: Allocate flexible tasks into available slots (only if time remains)
+  if (!hasTimeRemaining) {
+    log.info({ targetDate }, 'Past working hours — skipping flexible task allocation');
+  }
   for (const taskData of scoredTasks) {
+    if (!hasTimeRemaining) break;
     const { task } = taskData;
     if (allocatedFlexMinutes >= maxFlexMinutes) {
       log.debug({ task: task.title }, 'Slack limit reached, skipping task');
@@ -248,10 +259,13 @@ export async function planSchedule(
       const blockEnd = new Date(workingStart);
       blockEnd.setHours(endHour, 0, 0, 0);
       
+      const clampedStart = blockStart > workingStart ? blockStart : workingStart;
+      const clampedEnd = blockEnd < workingEnd ? blockEnd : workingEnd;
+      
       // Constrain within actual working hours
       preferred = {
-        idealStart: blockStart > workingStart ? blockStart : workingStart,
-        idealEnd: blockEnd < workingEnd ? blockEnd : workingEnd,
+        idealStart: clampedStart < clampedEnd ? clampedStart : workingStart,
+        idealEnd: clampedStart < clampedEnd ? clampedEnd : workingEnd,
       };
     }
 

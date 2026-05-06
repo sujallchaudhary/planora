@@ -30,6 +30,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
   const today = planningDateString(config.timezone, config.lateNightThresholdHour);
 
   let result: ActionResult;
+  let replanAlreadyDone = false;
 
   switch (state.intent.intent) {
     case IntentType.ADD_TASK: {
@@ -75,7 +76,14 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         message: `Added ${created.length} task(s)`,
         data: { tasks: created.map(t => ({ id: t._id, title: t.title, priority: t.priority })) },
       };
-      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      // Smart replan: target the earliest due date among added tasks, falling back to today
+      const dueDates = tasks.map(t => t.dueDate).filter(Boolean) as string[];
+      const earliestDue = dueDates.length > 0
+        ? dueDates.sort()[0]!
+        : today;
+      const replanTarget = earliestDue < today ? today : earliestDue;
+      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget);
+      replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
     }
@@ -100,10 +108,24 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         if (t.priority) updates.priority = t.priority;
         if (t.estimatedMinutes) updates.estimatedMinutes = t.estimatedMinutes;
         if (t.preferredTime) updates.preferredTime = t.preferredTime;
+        if (t.dueDate !== undefined) updates.dueDate = t.dueDate ? new Date(t.dueDate) : null;
+        if (t.isFixed !== undefined) updates.isFixed = t.isFixed;
+        if (t.fixedStartTime !== undefined) updates.fixedStartTime = t.fixedStartTime;
+        if (t.fixedEndTime !== undefined) updates.fixedEndTime = t.fixedEndTime;
       }
       await taskRepo.updateTask(task._id!.toString(), updates);
+      
+      // Determine which day to replan (the new due date if changed, otherwise today)
+      let replanTarget = today;
+      if (updates.dueDate) {
+        replanTarget = (updates.dueDate as Date).toISOString().split('T')[0]!;
+      } else if (task.dueDate) {
+        replanTarget = task.dueDate.toISOString().split('T')[0]!;
+      }
+      
       result = { success: true, action: 'modify_task', message: `Updated task "${task.title}"` };
-      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget);
+      replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
     }
@@ -122,6 +144,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       await taskRepo.deleteTask(matches[0]!._id!.toString());
       result = { success: true, action: 'delete_task', message: `Deleted task "${matches[0]!.title}"` };
       await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
     }
@@ -186,6 +209,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       };
       if (found) {
         await triggerReplan(state.telegramId, user._id.toString(), config, today);
+        replanAlreadyDone = true;
         result.message += ' and updated your schedule.';
       }
       break;
@@ -222,6 +246,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
 
       // Trigger partial replan
       await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      replanAlreadyDone = true;
       result = { success: true, action: 'skip_task', message: `Skipped "${taskTitle}" and replanned the rest of your day` };
       break;
     }
@@ -230,7 +255,44 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
     case IntentType.ADD_CONSTRAINT:
     case IntentType.ADD_HABIT: {
       // Memory signals are already stored in the extract-memory node
-      result = { success: true, action: 'add_memory', message: 'Got it! I\'ll remember that for future planning.' };
+      // BUT if the LLM also extracted tasks (e.g. "exam from 2-5 PM"), we must create them!
+      const memTasks = state.intent.tasks;
+      if (memTasks.length > 0) {
+        const created = [];
+        for (const task of memTasks) {
+          const newTask = await taskRepo.create({
+            userId: user._id,
+            telegramId: state.telegramId,
+            title: task.title,
+            description: task.description ?? undefined,
+            priority: task.priority ?? undefined,
+            cognitiveLoad: task.cognitiveLoad ?? undefined,
+            estimatedMinutes: task.estimatedMinutes ?? undefined,
+            dueDate: task.dueDate ? new Date(task.dueDate) : undefined,
+            preferredTime: task.preferredTime ?? undefined,
+            tags: task.tags ?? undefined,
+            isFixed: task.isFixed ?? undefined,
+            fixedStartTime: task.fixedStartTime ?? undefined,
+            fixedEndTime: task.fixedEndTime ?? undefined,
+          });
+          created.push(newTask);
+        }
+        // Smart replan: target the task's due date
+        const dueDates = memTasks.map(t => t.dueDate).filter(Boolean) as string[];
+        const replanTarget = dueDates.length > 0
+          ? (dueDates.sort()[0]! < today ? today : dueDates.sort()[0]!)
+          : today;
+        await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget);
+        replanAlreadyDone = true;
+        result = {
+          success: true,
+          action: 'add_memory',
+          message: `Got it! Added ${created.length} task(s) and updated your schedule.`,
+          data: { tasks: created.map(t => ({ id: t._id, title: t.title })) },
+        };
+      } else {
+        result = { success: true, action: 'add_memory', message: 'Got it! I\'ll remember that for future planning.' };
+      }
       break;
     }
 
@@ -394,8 +456,14 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
             break;
           }
           case IntentType.REPLAN: {
-            const count = await triggerReplan(state.telegramId, user._id.toString(), config, today);
-            msg = `Replanned — ${count} tasks scheduled`;
+            if (replanAlreadyDone) {
+              msg = 'Schedule already updated';
+            } else {
+              const replanDate = secondary.targetDate ?? today;
+              const count = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate);
+              replanAlreadyDone = true;
+              msg = `Replanned — ${count} tasks scheduled`;
+            }
             break;
           }
           default:

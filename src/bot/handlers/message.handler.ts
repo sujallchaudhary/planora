@@ -2,6 +2,7 @@ import type { Context } from 'grammy';
 import { runAgent } from '../../agent/graph.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { appendHistory } from '../conversation-history.js';
+import { getPendingAction, clearPendingAction } from '../pending-action.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('handler:message');
@@ -20,6 +21,15 @@ export function registerMessageHandler(bot: any): void {
     let inputText = text;
     if (ctx.message?.reply_to_message && ctx.message.reply_to_message.text) {
       inputText = `[Replying to your message: "${ctx.message.reply_to_message.text.substring(0, 100)}..."]\n${text}`;
+    }
+
+    // Check for pending actions (like answering a reschedule prompt)
+    const pending = getPendingAction(from.id);
+    if (pending) {
+      if (pending.type === 'reschedule') {
+        inputText = `[Context: User is answering prompt to reschedule task "${pending.taskTitle}"]\n${inputText}`;
+      }
+      clearPendingAction(from.id); // clear it so we don't inject it again
     }
 
     // Ensure user exists

@@ -9,6 +9,7 @@ import { replan } from '../../scheduler/replanner.js';
 import { todayString } from '../../utils/date.js';
 import { TaskStatus } from '../../config/defaults.js';
 import { createChildLogger } from '../../utils/logger.js';
+import { setPendingAction } from '../pending-action.js';
 
 const log = createChildLogger('handler:callback');
 
@@ -81,6 +82,12 @@ export function registerCallbackHandler(bot: any): void {
         break;
       }
       case 'reschedule': {
+        setPendingAction(from.id, {
+          type: 'reschedule',
+          taskTitle: entry.title,
+          taskId: entry.taskId?.toString(),
+          entryId: entryId
+        });
         await ctx.answerCallbackQuery('📅 Tell me when you\'d like to reschedule');
         await ctx.reply(`When would you like to reschedule *${entry.title}*? Just tell me in natural language.`, { parse_mode: 'Markdown' });
         break;

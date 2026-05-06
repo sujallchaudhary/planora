@@ -54,6 +54,7 @@ If the user's message is a short affirmation ("yes", "yes please", "sure", "ok",
 - Bot asked to show the schedule → SHOW_PLAN
 - Bot proposed skipping something → SKIP_TASK
 - Bot asked to mark something done → COMPLETE_TASK
+- Context says "User is answering prompt to reschedule task 'X'" → MODIFY_TASK (set taskReference to 'X', and update tasks[0] with the new time/date based on what the user says)
 - If negation ("no", "cancel") → GENERAL_CHAT with reasoning explaining what was cancelled
 Do NOT classify bare affirmations as GENERAL_CHAT when there is relevant context in history.
 
