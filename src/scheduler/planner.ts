@@ -4,6 +4,8 @@ import type { ITask } from '../memory/mongo/models/task.model.js';
 import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
 import type { UserConfig } from '../config/config-resolver.js';
+import type { PlanningContext } from './planning-context.js';
+import { hasLowEnergy } from './planning-context.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
 import { parseTimeString, formatDateString } from '../utils/date.js';
 import { findAvailableSlots, type TimeSlot, fitsInSlot } from './time-slots.js';
@@ -32,6 +34,62 @@ function scoreTask(task: ITask): number {
   return (task.priority * priorityWeight) + (task.cognitiveLoad * cognitiveWeight) + (urgency * urgencyWeight);
 }
 
+function blockWindow(
+  block: 'morning' | 'afternoon' | 'evening' | 'night' | 'any',
+  workingStart: Date,
+  workingEnd: Date,
+): { idealStart: Date; idealEnd: Date } {
+  if (block === 'any') return { idealStart: workingStart, idealEnd: workingEnd };
+
+  const start = new Date(workingStart);
+  const end = new Date(workingStart);
+
+  if (block === 'morning') {
+    start.setHours(6, 0, 0, 0);
+    end.setHours(12, 0, 0, 0);
+  } else if (block === 'afternoon') {
+    start.setHours(12, 0, 0, 0);
+    end.setHours(17, 0, 0, 0);
+  } else if (block === 'evening') {
+    start.setHours(17, 0, 0, 0);
+    end.setHours(22, 0, 0, 0);
+  } else {
+    start.setHours(20, 0, 0, 0);
+    end.setHours(23, 59, 0, 0);
+  }
+
+  const idealStart = start > workingStart ? start : workingStart;
+  const idealEnd = end < workingEnd ? end : workingEnd;
+  return idealStart < idealEnd
+    ? { idealStart, idealEnd }
+    : { idealStart: workingStart, idealEnd: workingEnd };
+}
+
+function inferBlockFromText(value: string | undefined): 'morning' | 'afternoon' | 'evening' | 'night' | null {
+  if (!value) return null;
+  const text = value.toLowerCase();
+  if (text.includes('late night') || text.includes('night')) return 'night';
+  if (text.includes('evening')) return 'evening';
+  if (text.includes('afternoon')) return 'afternoon';
+  if (text.includes('morning')) return 'morning';
+  return null;
+}
+
+function getPreference(memory: RetrievedMemory, key: string): string | undefined {
+  return memory.preferences.find(p => p.key === key)?.value;
+}
+
+function getLearnedFocusBlock(memory: RetrievedMemory): 'morning' | 'afternoon' | 'evening' | 'night' | null {
+  return inferBlockFromText(getPreference(memory, 'peak_focus_window'))
+    ?? inferBlockFromText(getPreference(memory, 'deep_work_time'))
+    ?? inferBlockFromText(getPreference(memory, 'study_time'));
+}
+
+function getLowSuccessBlock(memory: RetrievedMemory): 'morning' | 'afternoon' | 'evening' | 'night' | null {
+  return inferBlockFromText(getPreference(memory, 'low_success_window'))
+    ?? (getPreference(memory, 'morning_task_difficulty') === 'high' ? 'morning' : null);
+}
+
 /**
  * Determine preferred time window for a task based on cognitive load and user preferences.
  */
@@ -40,7 +98,30 @@ function getPreferredWindow(
   memory: RetrievedMemory,
   workingStart: Date,
   workingEnd: Date,
+  planningContext?: PlanningContext,
 ): { idealStart: Date; idealEnd: Date } {
+  const explicitTaskBlock = inferBlockFromText(task.preferredTime);
+  if (explicitTaskBlock) {
+    return blockWindow(explicitTaskBlock, workingStart, workingEnd);
+  }
+
+  const learnedFocusBlock = getLearnedFocusBlock(memory);
+  const lowSuccessBlock = getLowSuccessBlock(memory);
+
+  if (task.cognitiveLoad >= 3 && hasLowEnergy(planningContext)) {
+    const later = new Date(workingStart);
+    later.setHours(Math.max(later.getHours() + 2, 16), 0, 0, 0);
+    return { idealStart: later < workingEnd ? later : workingStart, idealEnd: workingEnd };
+  }
+
+  if (task.cognitiveLoad >= 2 && learnedFocusBlock && learnedFocusBlock !== lowSuccessBlock) {
+    return blockWindow(learnedFocusBlock, workingStart, workingEnd);
+  }
+
+  if (task.cognitiveLoad >= 3 && lowSuccessBlock === 'morning') {
+    return blockWindow('evening', workingStart, workingEnd);
+  }
+
   // Check if user has deep work time preference
   const deepWorkPref = memory.preferences.find(p => p.key === 'deep_work_time');
 
@@ -84,6 +165,7 @@ export async function planSchedule(
   memory: RetrievedMemory,
   config: UserConfig,
   targetDate: string,
+  planningContext: PlanningContext = {},
 ): Promise<IScheduleEntry[]> {
   const entries: IScheduleEntry[] = [];
 
@@ -115,6 +197,26 @@ export async function planSchedule(
   /** Convert snake_case key to Title Case for display */
   const prettyKey = (key: string) =>
     key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+  if (hasTimeRemaining && hasLowEnergy(planningContext) && planningContext.recoveryMinutes) {
+    const recoveryStart = effectiveStart;
+    const recoveryEnd = addMinutes(recoveryStart, planningContext.recoveryMinutes);
+    const clampedRecoveryEnd = recoveryEnd < workingEnd ? recoveryEnd : workingEnd;
+
+    if (clampedRecoveryEnd.getTime() - recoveryStart.getTime() >= 10 * 60 * 1000) {
+      occupiedSlots.push({ start: recoveryStart, end: clampedRecoveryEnd });
+      entries.push({
+        title: 'Recovery reset',
+        description: planningContext.reason ?? 'Low-energy recovery window before resuming planned work.',
+        startTime: recoveryStart,
+        endTime: clampedRecoveryEnd,
+        status: ScheduleEntryStatus.SCHEDULED,
+        priority: 4,
+        isFixed: false,
+        flexibility: 0.4,
+      } as IScheduleEntry);
+    }
+  }
 
   for (const constraint of memory.constraints) {
     const dayOfWeek = baseDateUTC.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
@@ -247,7 +349,7 @@ export async function planSchedule(
     const availableSlots = findAvailableSlots(bufferedSlots, effectiveStart, workingEnd, task.estimatedMinutes);
     
     // Determine preferred window
-    let preferred = getPreferredWindow(task, memory, effectiveStart, workingEnd);
+    let preferred = getPreferredWindow(task, memory, effectiveStart, workingEnd, planningContext);
     
     // Override with AI blueprint if available
     if (taskData.blueprint && taskData.blueprint.assignedBlock !== 'any') {
@@ -302,6 +404,24 @@ export async function planSchedule(
         isFixed: false,
         flexibility: 0.7,
       } as IScheduleEntry);
+
+      if (task.cognitiveLoad >= 3 && task.estimatedMinutes >= 50) {
+        const breakMinutes = Math.max(10, Math.min(20, config.bufferMinutes));
+        const breakEnd = addMinutes(taskEnd, breakMinutes);
+        if (breakEnd <= workingEnd) {
+          occupiedSlots.push({ start: taskEnd, end: breakEnd });
+          entries.push({
+            title: 'Recovery break',
+            description: 'Short buffer after deep work to reduce context-switching fatigue.',
+            startTime: taskEnd,
+            endTime: breakEnd,
+            status: ScheduleEntryStatus.SCHEDULED,
+            priority: 2,
+            isFixed: false,
+            flexibility: 0.8,
+          } as IScheduleEntry);
+        }
+      }
     } else {
       log.debug({ task: task.title }, 'No available slot found');
     }

@@ -3,6 +3,7 @@ import { AgentStateAnnotation, type AgentState } from './state.js';
 import { classifyIntentNode } from './nodes/classify-intent.node.js';
 import { extractMemoryNode } from './nodes/extract-memory.node.js';
 import { retrieveMemoryNode } from './nodes/retrieve-memory.node.js';
+import { analyzeContextNode } from './nodes/analyze-context.node.js';
 import { executeActionNode } from './nodes/execute-action.node.js';
 import { generateResponseNode } from './nodes/generate-response.node.js';
 import { IntentType } from '../config/defaults.js';
@@ -12,6 +13,10 @@ const log = createChildLogger('agent-graph');
 
 function routeByIntent(state: AgentState): string {
   const intent = state.intent?.intent;
+
+  if (state.autonomyContext?.shouldReplan) {
+    return 'execute-action';
+  }
 
   if (intent === IntentType.GENERAL_CHAT) {
     return 'generate-response';
@@ -25,6 +30,7 @@ function buildGraph() {
     .addNode('classify-intent', classifyIntentNode)
     .addNode('extract-memory', extractMemoryNode)
     .addNode('retrieve-memory', retrieveMemoryNode)
+    .addNode('analyze-context', analyzeContextNode)
     .addNode('execute-action', executeActionNode)
     .addNode('generate-response', generateResponseNode)
 
@@ -32,9 +38,10 @@ function buildGraph() {
     .addEdge(START, 'classify-intent')
     .addEdge('classify-intent', 'extract-memory')
     .addEdge('extract-memory', 'retrieve-memory')
+    .addEdge('retrieve-memory', 'analyze-context')
 
     // Conditional routing after memory retrieval
-    .addConditionalEdges('retrieve-memory', routeByIntent, {
+    .addConditionalEdges('analyze-context', routeByIntent, {
       'execute-action': 'execute-action',
       'generate-response': 'generate-response',
     })

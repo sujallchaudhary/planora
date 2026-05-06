@@ -61,6 +61,44 @@ export class TaskHistoryRepository {
     const completed = morning.filter(t => t.outcome === 'completed' || t.outcome === 'completed_late');
     return completed.length / morning.length;
   }
+
+  async getCompletionRatesByTimeBlock(telegramId: number, days: number): Promise<Record<string, { total: number; completed: number; rate: number }>> {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const histories = await TaskHistory.find({
+      telegramId,
+      createdAt: { $gte: cutoff },
+    });
+
+    const blocks: Record<string, { total: number; completed: number; rate: number }> = {
+      morning: { total: 0, completed: 0, rate: 0 },
+      afternoon: { total: 0, completed: 0, rate: 0 },
+      evening: { total: 0, completed: 0, rate: 0 },
+      night: { total: 0, completed: 0, rate: 0 },
+    };
+
+    for (const history of histories) {
+      const hour = history.scheduledStartTime.getHours();
+      const block = hour < 12
+        ? 'morning'
+        : hour < 17
+          ? 'afternoon'
+          : hour < 21
+            ? 'evening'
+            : 'night';
+
+      blocks[block]!.total += 1;
+      if (history.outcome === 'completed' || history.outcome === 'completed_late') {
+        blocks[block]!.completed += 1;
+      }
+    }
+
+    for (const block of Object.values(blocks)) {
+      block.rate = block.total > 0 ? block.completed / block.total : 0;
+    }
+
+    return blocks;
+  }
 }
 
 export const taskHistoryRepo = new TaskHistoryRepository();

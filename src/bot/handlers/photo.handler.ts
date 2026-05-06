@@ -2,6 +2,7 @@ import type { Context } from 'grammy';
 import { runAgent } from '../../agent/graph.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { appendHistory } from '../conversation-history.js';
+import { storeConversationTurn } from '../../memory/conversation-memory.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('handler:photo');
@@ -59,6 +60,12 @@ export function registerPhotoHandler(bot: any): void {
 
       // Save bot response so next message has full context
       appendHistory(from.id, 'assistant', result);
+      void storeConversationTurn({
+        userId: user._id.toString(),
+        telegramId: from.id,
+        userText: `[Image] ${inputText}`,
+        assistantText: result,
+      });
 
       await ctx.reply(result, { parse_mode: 'Markdown' }).catch(() => ctx.reply(result));
     } catch (error) {

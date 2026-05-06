@@ -1,7 +1,7 @@
 {
-  "name": "telegram-assistant",
+  "name": "memora",
   "version": "1.0.0",
-  "description": "Production-grade Telegram-first personal assistant agent",
+  "description": "Telegram-first autonomous personal operating system",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

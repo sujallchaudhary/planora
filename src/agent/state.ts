@@ -2,6 +2,7 @@ import { Annotation } from '@langchain/langgraph';
 import type { ClassificationResult, ImageExtractionResult } from '../utils/zod-schemas.js';
 import type { ActionResult } from '../llm/provider.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
+import type { AutonomyContext } from './autonomy-context.js';
 
 // ─── Agent State Definition ───────────────────────────────────────────────────
 export const AgentStateAnnotation = Annotation.Root({
@@ -23,6 +24,10 @@ export const AgentStateAnnotation = Annotation.Root({
     default: () => null,
   }),
   retrievedMemory: Annotation<RetrievedMemory | null>({
+    reducer: (_prev, next) => next,
+    default: () => null,
+  }),
+  autonomyContext: Annotation<AutonomyContext | null>({
     reducer: (_prev, next) => next,
     default: () => null,
   }),

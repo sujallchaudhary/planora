@@ -4,7 +4,7 @@ import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { taskHistoryRepo } from '../../memory/mongo/repositories/task-history.repo.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
-import { syncReminders } from '../../execution/job-manager.js';
+import { scheduleSnoozeReminder, syncReminders } from '../../execution/job-manager.js';
 import { replan } from '../../scheduler/replanner.js';
 import { todayString } from '../../utils/date.js';
 import { TaskStatus } from '../../config/defaults.js';
@@ -69,14 +69,15 @@ export function registerCallbackHandler(bot: any): void {
         const newEntries = await replan(tasks, updatedSchedule?.entries ?? [], {
           preferences: [], habits: [], constraints: [], semanticContext: [], recentHistory: [],
         }, config, today);
-        await scheduleRepo.createOrReplace(from.id, user._id, today, newEntries);
-        await syncReminders(from.id, today, newEntries);
+        const savedSchedule = await scheduleRepo.createOrReplace(from.id, user._id, today, newEntries);
+        await syncReminders(from.id, today, savedSchedule.entries);
 
         await ctx.answerCallbackQuery('⏭ Skipped! Schedule adjusted.');
         await ctx.editMessageText(`⏭ *${entry.title}* — skipped. Schedule replanned.`, { parse_mode: 'Markdown' });
         break;
       }
       case 'snooze': {
+        await scheduleSnoozeReminder(from.id, today, entry, config.snoozeMinutes);
         await ctx.answerCallbackQuery(`⏰ Snoozed for ${config.snoozeMinutes} min`);
         await ctx.editMessageText(`⏰ *${entry.title}* — snoozed for ${config.snoozeMinutes} minutes.`, { parse_mode: 'Markdown' });
         break;

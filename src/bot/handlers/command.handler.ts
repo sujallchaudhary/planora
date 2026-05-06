@@ -33,7 +33,7 @@ export function registerCommandHandlers(bot: any): void {
     try { await scheduleDailyPlans(); } catch (e) { /* ignore */ }
 
     await ctx.reply(
-      `👋 Hey ${from.first_name}! I'm your personal planning assistant.\n\n` +
+      `👋 Hey ${from.first_name}! I'm Memora, your personal operating system.\n\n` +
       `Here's what I can do:\n` +
       `📋 Tell me your tasks in natural language\n` +
       `📸 Send me photos of schedules or task lists\n` +
@@ -259,7 +259,7 @@ export function registerCommandHandlers(bot: any): void {
   bot.command('help', async (ctx: Context) => {
 
     await ctx.reply(
-      `🤖 *Personal Planning Assistant*\n\n` +
+      `🤖 *Memora Personal Operating System*\n\n` +
       `*Commands:*\n` +
       `/start — Register and get started\n` +
       `/tasks — View all your pending tasks\n` +

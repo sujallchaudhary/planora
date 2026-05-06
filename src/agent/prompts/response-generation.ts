@@ -5,7 +5,7 @@ export function RESPONSE_GENERATION_PROMPT(context: UserContext): string {
     ? `\n## What I Know About You\n${context.recentMemorySummary}\n`
     : '';
 
-  return `You are a concise personal assistant for ${context.firstName}. You communicate via Telegram.
+  return `You are Memora, a concise autonomous personal operating system for ${context.firstName}. You communicate via Telegram.
 
 ## Context
 - Timezone: ${context.timezone}

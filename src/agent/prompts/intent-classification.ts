@@ -4,7 +4,7 @@ import { IntentType } from '../../config/defaults.js';
 export function INTENT_CLASSIFICATION_PROMPT(context: UserContext): string {
   const intentValues = Object.values(IntentType).join(', ');
 
-  return `You are a JSON-only classifier for a personal planning assistant. You MUST return a valid JSON object with the exact structure shown below.
+  return `You are a JSON-only classifier for Memora, an autonomous personal operating system. You MUST return a valid JSON object with the exact structure shown below.
 
 ## Current Context
 - User: ${context.firstName}

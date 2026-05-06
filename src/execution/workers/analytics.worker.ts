@@ -23,6 +23,7 @@ export function startAnalyticsWorker(): Worker {
       const config = resolveUserConfig(user.settings);
       const stats = await taskHistoryRepo.getOutcomeStats(telegramId, 7);
       const morningRate = await taskHistoryRepo.getMorningCompletionRate(telegramId, 7);
+      const blockStats = await taskHistoryRepo.getCompletionRatesByTimeBlock(telegramId, 21);
 
       // Conservative pattern detection
       if (morningRate < 0.3 && (stats['missed'] ?? 0) > config.memoryMinDataPoints) {
@@ -35,17 +36,45 @@ export function startAnalyticsWorker(): Worker {
         log.info({ telegramId, morningRate }, 'Detected morning task difficulty pattern');
       }
 
+      const eligibleBlocks = Object.entries(blockStats).filter(([, s]) => s.total >= config.memoryMinDataPoints);
+      const bestBlock = eligibleBlocks
+        .filter(([, s]) => s.rate >= 0.7)
+        .sort((a, b) => b[1].rate - a[1].rate)[0];
+      const worstBlock = eligibleBlocks
+        .filter(([, s]) => s.rate <= 0.4)
+        .sort((a, b) => a[1].rate - b[1].rate)[0];
+
+      if (bestBlock) {
+        await preferenceRepo.upsert(telegramId, user._id, {
+          key: 'peak_focus_window',
+          value: bestBlock[0],
+          confidence: Math.min(0.92, 0.55 + bestBlock[1].rate * 0.35),
+          source: 'inferred',
+        });
+        log.info({ telegramId, block: bestBlock[0], rate: bestBlock[1].rate }, 'Detected peak focus window');
+      }
+
+      if (worstBlock) {
+        await preferenceRepo.upsert(telegramId, user._id, {
+          key: 'low_success_window',
+          value: worstBlock[0],
+          confidence: Math.min(0.9, 0.55 + (1 - worstBlock[1].rate) * 0.3),
+          source: 'inferred',
+        });
+        log.info({ telegramId, block: worstBlock[0], rate: worstBlock[1].rate }, 'Detected low-success window');
+      }
+
       // Store behavioral insight as semantic memory
       try {
         const llm = getLLMProvider();
         const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));
-        const summary = `Week summary: ${JSON.stringify(stats)}, morning completion: ${(morningRate * 100).toFixed(0)}%`;
+        const summary = `Week summary: ${JSON.stringify(stats)}, morning completion: ${(morningRate * 100).toFixed(0)}%, block stats: ${JSON.stringify(blockStats)}`;
         await semanticMemory.store({
           userId: user._id.toString(),
           telegramId,
           type: 'behavior',
           content: summary,
-          metadata: { stats, morningRate },
+          metadata: { stats, morningRate, blockStats, bestBlock: bestBlock?.[0], worstBlock: worstBlock?.[0] },
           timestamp: new Date().toISOString(),
           confidence: 0.8,
         });

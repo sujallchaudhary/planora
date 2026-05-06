@@ -10,12 +10,14 @@ const log = createChildLogger('job-manager');
 
 export interface ReminderJobData {
   telegramId: number;
+  date: string;
   entryId: string;
   title: string;
   description: string;
   startTime: string;
   endTime: string;
-  type: 'pre_reminder' | 'start_reminder';
+  type: 'pre_reminder' | 'start_reminder' | 'snooze_reminder' | 'follow_up' | 'escalation';
+  escalationLevel?: number;
 }
 
 /**
@@ -47,7 +49,10 @@ export async function syncReminders(
     if (entry.status !== 'scheduled') continue;
 
     const entryId = (entry as any)._id?.toString() ?? '';
+    if (!entryId) continue;
+
     const startTime = new Date(entry.startTime);
+    const endTime = new Date(entry.endTime);
     const preReminderTime = addMinutes(startTime, -config.reminderLeadMinutes);
 
     // Pre-reminder (X minutes before)
@@ -58,6 +63,7 @@ export async function syncReminders(
         'pre_reminder',
         {
           telegramId,
+          date,
           entryId,
           title: entry.title,
           description: entry.description,
@@ -82,6 +88,7 @@ export async function syncReminders(
         'start_reminder',
         {
           telegramId,
+          date,
           entryId,
           title: entry.title,
           description: entry.description,
@@ -97,7 +104,90 @@ export async function syncReminders(
         }
       );
     }
+
+    if (entry.taskId) {
+      const followUpTime = addMinutes(endTime, Math.max(5, Math.floor(config.bufferMinutes / 2)));
+      const followDelay = msUntil(followUpTime);
+      if (followDelay > 0) {
+        await queue.add(
+          'follow_up',
+          {
+            telegramId,
+            date,
+            entryId,
+            title: entry.title,
+            description: entry.description,
+            startTime: entry.startTime.toISOString(),
+            endTime: entry.endTime.toISOString(),
+            type: 'follow_up',
+            escalationLevel: 1,
+          } satisfies ReminderJobData,
+          {
+            jobId: `${jobPrefix}_${entryId}_follow`,
+            delay: followDelay,
+            removeOnComplete: { count: 100 },
+            removeOnFail: { age: 86400 },
+          }
+        );
+      }
+
+      const escalationTime = addMinutes(endTime, Math.max(30, config.snoozeMinutes * 2));
+      const escalationDelay = msUntil(escalationTime);
+      if (escalationDelay > 0) {
+        await queue.add(
+          'escalation',
+          {
+            telegramId,
+            date,
+            entryId,
+            title: entry.title,
+            description: entry.description,
+            startTime: entry.startTime.toISOString(),
+            endTime: entry.endTime.toISOString(),
+            type: 'escalation',
+            escalationLevel: 2,
+          } satisfies ReminderJobData,
+          {
+            jobId: `${jobPrefix}_${entryId}_escalation`,
+            delay: escalationDelay,
+            removeOnComplete: { count: 100 },
+            removeOnFail: { age: 86400 },
+          }
+        );
+      }
+    }
   }
 
   log.info({ telegramId, date, entries: entries.length }, 'Synced reminders');
+}
+
+export async function scheduleSnoozeReminder(
+  telegramId: number,
+  date: string,
+  entry: IScheduleEntry,
+  snoozeMinutes: number,
+): Promise<void> {
+  const queue = getReminderQueue();
+  const entryId = (entry as any)._id?.toString() ?? '';
+  if (!entryId) return;
+
+  await queue.add(
+    'snooze_reminder',
+    {
+      telegramId,
+      date,
+      entryId,
+      title: entry.title,
+      description: entry.description,
+      startTime: entry.startTime.toISOString(),
+      endTime: entry.endTime.toISOString(),
+      type: 'snooze_reminder',
+    } satisfies ReminderJobData,
+    {
+      jobId: `reminder_${telegramId}_${date}_${entryId}_snooze_${Date.now()}`,
+      delay: snoozeMinutes * 60 * 1000,
+      removeOnComplete: { count: 100 },
+      removeOnFail: { age: 86400 },
+    }
+  );
 }

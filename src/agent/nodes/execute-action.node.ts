@@ -12,6 +12,7 @@ import { syncReminders } from '../../execution/job-manager.js';
 import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
 import { planningDateString, nowInTimezone } from '../../utils/date.js';
 import { createChildLogger } from '../../utils/logger.js';
+import type { PlanningContext } from '../../scheduler/planning-context.js';
 
 const log = createChildLogger('node:execute');
 
@@ -31,8 +32,11 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
 
   let result: ActionResult;
   let replanAlreadyDone = false;
+  const effectiveIntent = state.autonomyContext?.shouldReplan && state.intent.intent === IntentType.GENERAL_CHAT
+    ? IntentType.REPLAN
+    : state.intent.intent;
 
-  switch (state.intent.intent) {
+  switch (effectiveIntent) {
     case IntentType.ADD_TASK: {
       const tasks = state.intent.tasks;
       // Also include tasks extracted from images
@@ -82,7 +86,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         ? dueDates.sort()[0]!
         : today;
       const replanTarget = earliestDue < today ? today : earliestDue;
-      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget);
+      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget, state.autonomyContext?.planningContext);
       replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
@@ -124,7 +128,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       }
       
       result = { success: true, action: 'modify_task', message: `Updated task "${task.title}"` };
-      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget);
+      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget, state.autonomyContext?.planningContext);
       replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
@@ -143,7 +147,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       }
       await taskRepo.deleteTask(matches[0]!._id!.toString());
       result = { success: true, action: 'delete_task', message: `Deleted task "${matches[0]!.title}"` };
-      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
       replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
@@ -208,7 +212,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         message: found ? `Marked "${taskTitle}" as completed ✅` : 'I couldn\'t find that task in your schedule. Try /schedule to see your tasks.',
       };
       if (found) {
-        await triggerReplan(state.telegramId, user._id.toString(), config, today);
+        await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
         replanAlreadyDone = true;
         result.message += ' and updated your schedule.';
       }
@@ -245,7 +249,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       }
 
       // Trigger partial replan
-      await triggerReplan(state.telegramId, user._id.toString(), config, today);
+      await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
       replanAlreadyDone = true;
       result = { success: true, action: 'skip_task', message: `Skipped "${taskTitle}" and replanned the rest of your day` };
       break;
@@ -282,7 +286,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         const replanTarget = dueDates.length > 0
           ? (dueDates.sort()[0]! < today ? today : dueDates.sort()[0]!)
           : today;
-        await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget);
+        await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget, state.autonomyContext?.planningContext);
         replanAlreadyDone = true;
         result = {
           success: true,
@@ -298,13 +302,13 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
 
     case IntentType.REPLAN: {
       const replanDate = state.intent.targetDate ?? today;
-      const newEntries = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate);
+      const newEntries = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate, state.autonomyContext?.planningContext);
       const dateLabel = replanDate === today ? 'your day' : replanDate;
       result = {
         success: true,
         action: 'replan',
         message: `Replanned ${dateLabel} — ${newEntries} tasks scheduled`,
-        data: { scheduledCount: newEntries, reason: state.intent.replanContext, targetDate: replanDate },
+        data: { scheduledCount: newEntries, reason: state.intent.replanContext ?? state.autonomyContext?.summary, targetDate: replanDate },
       };
       break;
     }
@@ -460,7 +464,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
               msg = 'Schedule already updated';
             } else {
               const replanDate = secondary.targetDate ?? today;
-              const count = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate);
+              const count = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate, state.autonomyContext?.planningContext);
               replanAlreadyDone = true;
               msg = `Replanned — ${count} tasks scheduled`;
             }
@@ -486,7 +490,13 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
   return { actionResult: result };
 }
 
-async function triggerReplan(telegramId: number, userId: string, config: any, today: string): Promise<number> {
+async function triggerReplan(
+  telegramId: number,
+  userId: string,
+  config: any,
+  today: string,
+  planningContext?: PlanningContext,
+): Promise<number> {
   try {
     const tasks = await taskRepo.findPendingTasks(telegramId);
     const existingSchedule = await scheduleRepo.findByDate(telegramId, today);
@@ -513,6 +523,7 @@ async function triggerReplan(telegramId: number, userId: string, config: any, to
       memory,
       config,
       today,
+      planningContext,
     );
 
     const schedule = await scheduleRepo.createOrReplace(telegramId, userDoc._id, today, newEntries);
