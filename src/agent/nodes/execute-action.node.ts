@@ -357,9 +357,24 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
     case IntentType.SHOW_PLAN: {
       const showDate = state.intent.targetDate ?? today;
       const schedule = await scheduleRepo.findByDate(state.telegramId, showDate);
+      const pendingTasks = await taskRepo.findPendingTasks(state.telegramId);
       const dateLabel = showDate === today ? 'today' : showDate;
+
       if (!schedule || schedule.entries.length === 0) {
-        result = { success: true, action: 'show_plan', message: `No schedule for ${dateLabel} yet. Say "plan ${dateLabel}" to create one.`, data: { entries: [], targetDate: showDate } };
+        if (pendingTasks.length > 0) {
+          result = {
+            success: true,
+            action: 'show_plan',
+            message: `No schedule for ${dateLabel} yet, but you have ${pendingTasks.length} pending task(s). Say "plan my day" to schedule them.`,
+            data: {
+              entries: [],
+              targetDate: showDate,
+              pendingTasks: pendingTasks.map(t => ({ id: t._id, title: t.title, priority: t.priority, estimatedMinutes: t.estimatedMinutes })),
+            },
+          };
+        } else {
+          result = { success: true, action: 'show_plan', message: `No schedule or pending tasks for ${dateLabel}.`, data: { entries: [], targetDate: showDate, pendingTasks: [] } };
+        }
       } else {
         result = {
           success: true,
@@ -374,6 +389,7 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
               status: e.status,
               priority: e.priority,
             })),
+            pendingTasks: pendingTasks.map(t => ({ id: t._id, title: t.title, priority: t.priority, estimatedMinutes: t.estimatedMinutes })),
           },
         };
       }
