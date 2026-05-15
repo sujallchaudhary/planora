@@ -86,7 +86,13 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         ? dueDates.sort()[0]!
         : today;
       const replanTarget = earliestDue < today ? today : earliestDue;
-      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget, state.autonomyContext?.planningContext);
+
+      // Always replan today to fit the new tasks, and if the early due date is different, replan that too
+      const datesToReplan = Array.from(new Set([today, replanTarget]));
+      for (const targetDate of datesToReplan) {
+        await triggerReplan(state.telegramId, user._id.toString(), config, targetDate, state.autonomyContext?.planningContext);
+      }
+      
       replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
       break;
@@ -155,8 +161,39 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
 
     case IntentType.COMPLETE_TASK: {
       const ref = state.intent.taskReference;
+      const rawInput = state.rawInput?.toLowerCase().trim() || '';
+      
+      const isAllForm = /^(?:all|all tasks|all rasks?|everything)$/i.test(ref ?? '');
+      const rawImpliesAll = /^(?:mark|set|complete)?\s*(?:all|everything|all tasks?|all rasks?)\s*(?:as )?(?:done|completed|finished)?$/i.test(rawInput) && rawInput.length > 0;
+      
       const todaySchedule = await scheduleRepo.findByDate(state.telegramId, today);
+      let countComplete = 0;
       let taskTitle = ref ?? 'task';
+
+      if (isAllForm || rawImpliesAll) {
+        if (todaySchedule) {
+          for (const e of todaySchedule.entries) {
+            if (e.status === 'scheduled' || e.status === 'active') {
+              await scheduleRepo.updateEntryStatus(state.telegramId, today, (e as any)._id.toString(), 'completed');
+              if (e.taskId) {
+                await taskRepo.updateStatus(e.taskId.toString(), TaskStatus.COMPLETED);
+              }
+              countComplete++;
+            }
+          }
+        }
+        const pending = await taskRepo.findPendingTasks(state.telegramId);
+        for (const pt of pending) {
+          await taskRepo.updateStatus(pt._id!.toString(), TaskStatus.COMPLETED);
+          countComplete++;
+        }
+        result = { success: true, action: 'complete_task', message: `Marked ${countComplete} tasks as completed ✅` };
+        replanAlreadyDone = true;
+        await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
+        result.message += ' and updated your schedule.';
+        break;
+      }
+
       let found = false;
 
       if (todaySchedule && todaySchedule.entries.length > 0) {

@@ -29,8 +29,21 @@ export function registerCommandHandlers(bot: any): void {
       username: from.username,
     });
 
-    // Schedule daily plan for this user
-    try { await scheduleDailyPlans(); } catch (e) { /* ignore */ }
+    // Schedule daily plan for THIS user only, not all users
+    try {
+      const config = resolveUserConfig(user.settings);
+      const [hour, minute] = config.dailyPlanTime.split(':');
+      const { getDailyPlanQueue } = await import('../../execution/queue.js');
+      await getDailyPlanQueue().add(
+        'generate-plan',
+        { telegramId: user.telegramId },
+        {
+          jobId: `daily-plan_${user.telegramId}`,
+          repeat: { pattern: `0 ${minute} ${hour} * * *`, tz: config.timezone },
+          removeOnComplete: { count: 10 },
+        }
+      );
+    } catch (e) { /* ignore */ }
 
     await ctx.reply(
       `👋 Hey ${from.first_name}! I'm Memora, your personal operating system.\n\n` +
@@ -59,10 +72,6 @@ export function registerCommandHandlers(bot: any): void {
     await ctx.reply('🔄 Planning your day...');
 
     const tasks = await taskRepo.findPendingTasks(from.id);
-    if (tasks.length === 0) {
-      await ctx.reply('📭 No pending tasks. Tell me what you need to do!');
-      return;
-    }
 
     const llm = getLLMProvider();
     const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));

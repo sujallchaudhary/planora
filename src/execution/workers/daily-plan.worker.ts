@@ -30,17 +30,19 @@ export function startDailyPlanWorker(): Worker {
       const today = todayString(config.timezone);
       const tasks = await taskRepo.findPendingTasks(telegramId);
 
-      if (tasks.length === 0) {
-        await getBotInstance().api.sendMessage(telegramId,
-          '☀️ Good morning! You have no pending tasks. Enjoy your free day!');
-        return;
-      }
-
       const llm = getLLMProvider();
       const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));
       const retriever = new HybridRetriever(semanticMemory);
       const memory = await retriever.retrieve(telegramId, `Daily plan for ${today}`, config.memoryConfidenceThreshold);
       const entries = await planSchedule(tasks, memory, config, today);
+
+      if (entries.length === 0) {
+        if (tasks.length === 0) {
+           await getBotInstance().api.sendMessage(telegramId, '☀️ Good morning! You have no pending tasks and no habits/constraints scheduled. Enjoy your free day!');
+        }
+        return;
+      }
+
       const schedule = await scheduleRepo.createOrReplace(telegramId, user._id, today, entries);
       await syncReminders(telegramId, today, schedule.entries);
 

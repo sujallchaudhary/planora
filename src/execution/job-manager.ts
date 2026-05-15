@@ -36,9 +36,9 @@ export async function syncReminders(
   // Cancel existing reminders for this user+date
   const jobPrefix = `reminder_${telegramId}_${date}`;
 
-  // Get all delayed jobs and remove matching ones
-  const delayed = await queue.getDelayed();
-  for (const job of delayed) {
+  // Get all delayed, waiting, and active jobs to remove matching ones
+  const scheduled = await queue.getJobs(['delayed', 'waiting', 'active', 'prioritized']);
+  for (const job of scheduled) {
     if (job.id?.startsWith(jobPrefix)) {
       await job.remove();
     }
