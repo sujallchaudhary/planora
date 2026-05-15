@@ -5,7 +5,6 @@ import type { UserConfig } from '../config/config-resolver.js';
 import type { PlanningContext } from './planning-context.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
 import { planSchedule } from './planner.js';
-import { nowInTimezone } from '../utils/date.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('replanner');
@@ -28,7 +27,7 @@ export async function replan(
   targetDate: string,
   planningContext: PlanningContext = {},
 ): Promise<IScheduleEntry[]> {
-  const now = nowInTimezone(config.timezone);
+  const now = new Date();
 
   log.info({ targetDate, existingEntries: existingEntries.length }, 'Starting partial replan');
 

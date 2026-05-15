@@ -4,7 +4,7 @@ import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
-import { nowInTimezone, formatTime, formatDateString, todayString } from '../../utils/date.js';
+import { formatTime, formatDateString, todayString } from '../../utils/date.js';
 import { IntentType } from '../../config/defaults.js';
 import { createChildLogger } from '../../utils/logger.js';
 

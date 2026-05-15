@@ -10,7 +10,7 @@ import { planSchedule } from '../../scheduler/planner.js';
 import { replan } from '../../scheduler/replanner.js';
 import { syncReminders } from '../../execution/job-manager.js';
 import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
-import { planningDateString, nowInTimezone } from '../../utils/date.js';
+import { planningDateString } from '../../utils/date.js';
 import { createChildLogger } from '../../utils/logger.js';
 import type { PlanningContext } from '../../scheduler/planning-context.js';
 

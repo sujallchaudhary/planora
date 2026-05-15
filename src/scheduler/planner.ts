@@ -1,5 +1,4 @@
 import { addMinutes } from 'date-fns';
-import { fromZonedTime, toZonedTime } from 'date-fns-tz';
 import type { ITask } from '../memory/mongo/models/task.model.js';
 import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
@@ -177,7 +176,7 @@ export async function planSchedule(
 
   // Use the later of working hours start or current time for flexible task scheduling
   // This prevents scheduling tasks in the past (e.g. at 11:41 AM, don't schedule at 8 AM)
-  const now = toZonedTime(new Date(), config.timezone);
+  const now = new Date();
   const effectiveStart = now > workingStart ? now : workingStart;
 
   log.info({ targetDate, tasks: tasks.length, effectiveStart: effectiveStart.toISOString() }, 'Planning schedule');
