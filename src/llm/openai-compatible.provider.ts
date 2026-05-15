@@ -83,7 +83,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
           ...(context.conversationHistory ?? []),
           { role: 'user', content: input },
         ],
-        response_format: { type: 'json_object' },
       });
 
       const content = response.choices[0]?.message?.content;
@@ -334,7 +333,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
         temperature: this.temperature,
         max_tokens: this.maxTokens,
         messages: [{ role: 'system', content: systemPrompt }],
-        response_format: { type: 'json_object' },
       });
 
       const content = response.choices[0]?.message?.content;
