@@ -32,7 +32,7 @@ export class TaskRepository {
   async findPendingTasks(telegramId: number): Promise<ITask[]> {
     return Task.find({
       telegramId,
-      status: { $in: [TaskStatus.PENDING, TaskStatus.SCHEDULED] },
+      status: { $in: [TaskStatus.PENDING, TaskStatus.SCHEDULED, TaskStatus.ACTIVE] },
     }).sort({ priority: -1, createdAt: 1 });
   }
 
@@ -64,7 +64,7 @@ export class TaskRepository {
   async countPendingTasks(telegramId: number): Promise<number> {
     return Task.countDocuments({
       telegramId,
-      status: { $in: [TaskStatus.PENDING, TaskStatus.SCHEDULED] },
+      status: { $in: [TaskStatus.PENDING, TaskStatus.SCHEDULED, TaskStatus.ACTIVE] },
     });
   }
 }

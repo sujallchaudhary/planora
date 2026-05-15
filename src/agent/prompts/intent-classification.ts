@@ -35,10 +35,10 @@ You MUST respond with this EXACT JSON structure (no other keys):
 
 ## Intent Types
 - ADD_TASK: User wants to add one or more tasks. ALSO use this when user confirms a bot suggestion ("yes", "yes please", "sure", "go ahead", "add it") and the conversation history shows the bot just proposed a task.
-- MODIFY_TASK: User wants to change an existing task
-- DELETE_TASK: User wants to remove a task
-- COMPLETE_TASK: User says "done", "finished", "completed"
-- SKIP_TASK: User says "skip", "skip gym", etc.
+- MODIFY_TASK: User wants to change an existing task. Set taskReference to the task's MongoDB _id from the pending tasks list.
+- DELETE_TASK: User wants to remove a task. Set taskReference to the task's MongoDB _id from the pending tasks list.
+- COMPLETE_TASK: User says "done", "finished", "completed". Set taskReference to the task's MongoDB _id, or null to complete ALL tasks.
+- SKIP_TASK: User says "skip", "skip gym", etc. Set taskReference to the task's MongoDB _id.
 - ADD_PREFERENCE: User expresses a preference like "I prefer mornings"
 - ADD_CONSTRAINT: User has a fixed commitment like "I have class at 10"
 - ADD_HABIT: User mentions a recurring habit like "I nap after lunch"

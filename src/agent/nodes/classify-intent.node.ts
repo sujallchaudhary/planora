@@ -20,7 +20,7 @@ export async function classifyIntentNode(state: AgentState): Promise<Partial<Age
   const zonedNow = nowInTimezone(config.timezone);
   const pendingTasks = await taskRepo.findPendingTasks(state.telegramId);
   const pendingCount = pendingTasks.length;
-  const pendingTasksList = pendingTasks.map(t => `- ${t.title}`).join('\n');
+  const pendingTasksList = pendingTasks.map(t => `- [${t._id}] ${t.title}`).join('\n');
   const todaySchedule = await scheduleRepo.findByDate(state.telegramId, todayString(config.timezone));
 
   const context = {

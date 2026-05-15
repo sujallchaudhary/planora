@@ -104,12 +104,11 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         result = { success: false, action: 'modify_task', message: 'Which task do you want to modify?' };
         break;
       }
-      const matches = await taskRepo.findByTitle(state.telegramId, ref);
-      if (matches.length === 0) {
-        result = { success: false, action: 'modify_task', message: `I couldn't find a task matching "${ref}".` };
+      const task = await taskRepo.findById(ref) ?? (await taskRepo.findByTitle(state.telegramId, ref))[0];
+      if (!task) {
+        result = { success: false, action: 'modify_task', message: `I couldn't find that task.` };
         break;
       }
-      const task = matches[0]!;
       const updates: Record<string, unknown> = {};
       if (state.intent.tasks[0]) {
         const t = state.intent.tasks[0];
@@ -146,13 +145,13 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
         result = { success: false, action: 'delete_task', message: 'Which task do you want to delete?' };
         break;
       }
-      const matches = await taskRepo.findByTitle(state.telegramId, ref);
-      if (matches.length === 0) {
-        result = { success: false, action: 'delete_task', message: `I couldn't find a task matching "${ref}".` };
+      const taskToDelete = await taskRepo.findById(ref) ?? (await taskRepo.findByTitle(state.telegramId, ref))[0];
+      if (!taskToDelete) {
+        result = { success: false, action: 'delete_task', message: `I couldn't find that task.` };
         break;
       }
-      await taskRepo.deleteTask(matches[0]!._id!.toString());
-      result = { success: true, action: 'delete_task', message: `Deleted task "${matches[0]!.title}"` };
+      await taskRepo.deleteTask(taskToDelete._id!.toString());
+      result = { success: true, action: 'delete_task', message: `Deleted task "${taskToDelete.title}"` };
       await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
       replanAlreadyDone = true;
       result.message += ' and updated your schedule.';
@@ -161,16 +160,13 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
 
     case IntentType.COMPLETE_TASK: {
       const ref = state.intent.taskReference;
-      const rawInput = state.rawInput?.toLowerCase().trim() || '';
-      
-      const isAllForm = /^(?:all|all tasks|all rasks?|everything)$/i.test(ref ?? '');
-      const rawImpliesAll = /^(?:mark|set|complete)?\s*(?:all|everything|all tasks?|all rasks?)\s*(?:as )?(?:done|completed|finished)?$/i.test(rawInput) && rawInput.length > 0;
-      
+
       const todaySchedule = await scheduleRepo.findByDate(state.telegramId, today);
       let countComplete = 0;
       let taskTitle = ref ?? 'task';
 
-      if (isAllForm || rawImpliesAll) {
+      // No specific task referenced → complete everything
+      if (!ref) {
         if (todaySchedule) {
           for (const e of todaySchedule.entries) {
             if (e.status === 'scheduled' || e.status === 'active') {
@@ -196,50 +192,30 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
 
       let found = false;
 
-      if (todaySchedule && todaySchedule.entries.length > 0) {
-        // First try to match by taskReference title
-        let targetEntry = ref
-          ? todaySchedule.entries.find(e =>
-              (e.status === 'scheduled' || e.status === 'active') &&
-              e.title.toLowerCase().includes(ref.toLowerCase())
-            )
-          : undefined;
+      // Look up by task _id first (from LLM), then check schedule
+      const taskById = await taskRepo.findById(ref);
+      if (taskById) {
+        await taskRepo.updateStatus(taskById._id!.toString(), TaskStatus.COMPLETED);
+        taskTitle = taskById.title;
+        found = true;
 
-        // Fall back to the first active/scheduled entry
-        if (!targetEntry) {
-          targetEntry = todaySchedule.entries.find(e =>
-            e.status === 'scheduled' || e.status === 'active'
-          );
-        }
-
-        if (targetEntry) {
-          await scheduleRepo.updateEntryStatus(state.telegramId, today, (targetEntry as any)._id.toString(), 'completed');
-          taskTitle = targetEntry.title;
-          found = true;
-          if (targetEntry.taskId) {
-            await taskRepo.updateStatus(targetEntry.taskId.toString(), TaskStatus.COMPLETED);
+        // Also update the schedule entry if it exists
+        if (todaySchedule) {
+          const scheduleEntry = todaySchedule.entries.find(e => e.taskId?.toString() === taskById._id!.toString());
+          if (scheduleEntry) {
+            await scheduleRepo.updateEntryStatus(state.telegramId, today, (scheduleEntry as any)._id.toString(), 'completed');
             await taskHistoryRepo.record({
               userId: user._id,
               telegramId: state.telegramId,
-              taskId: targetEntry.taskId,
-              title: targetEntry.title,
+              taskId: taskById._id!,
+              title: taskById.title,
               scheduledDate: today,
-              scheduledStartTime: targetEntry.startTime,
-              scheduledEndTime: targetEntry.endTime,
+              scheduledStartTime: scheduleEntry.startTime,
+              scheduledEndTime: scheduleEntry.endTime,
               outcome: 'completed',
               completedAt: new Date(),
             });
           }
-        }
-      }
-
-      // Also mark the underlying task as complete if found by title alone (no schedule)
-      if (!found && ref) {
-        const matches = await taskRepo.findByTitle(state.telegramId, ref);
-        if (matches.length > 0) {
-          await taskRepo.updateStatus(matches[0]!._id!.toString(), TaskStatus.COMPLETED);
-          taskTitle = matches[0]!.title;
-          found = true;
         }
       }
 
@@ -260,11 +236,39 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
       const ref = state.intent.taskReference;
       const todaySchedule = await scheduleRepo.findByDate(state.telegramId, today);
       let taskTitle = ref ?? 'current task';
+      let skipped = false;
 
-      if (todaySchedule) {
+      // Look up by task _id first
+      if (ref) {
+        const taskById = await taskRepo.findById(ref);
+        if (taskById) {
+          await taskRepo.updateStatus(taskById._id!.toString(), TaskStatus.SKIPPED);
+          taskTitle = taskById.title;
+          skipped = true;
+
+          if (todaySchedule) {
+            const scheduleEntry = todaySchedule.entries.find(e => e.taskId?.toString() === taskById._id!.toString());
+            if (scheduleEntry) {
+              await scheduleRepo.updateEntryStatus(state.telegramId, today, (scheduleEntry as any)._id.toString(), 'skipped');
+              await taskHistoryRepo.record({
+                userId: user._id,
+                telegramId: state.telegramId,
+                taskId: taskById._id!,
+                title: taskById.title,
+                scheduledDate: today,
+                scheduledStartTime: scheduleEntry.startTime,
+                scheduledEndTime: scheduleEntry.endTime,
+                outcome: 'skipped',
+              });
+            }
+          }
+        }
+      }
+
+      // Fallback: skip first active/scheduled entry if no ref
+      if (!skipped && todaySchedule) {
         const activeEntry = todaySchedule.entries.find(e =>
-          (e.status === 'scheduled' || e.status === 'active') &&
-          (!ref || e.title.toLowerCase().includes(ref.toLowerCase()))
+          e.status === 'scheduled' || e.status === 'active'
         );
         if (activeEntry) {
           await scheduleRepo.updateEntryStatus(state.telegramId, today, (activeEntry as any)._id.toString(), 'skipped');
@@ -455,18 +459,18 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
           }
           case IntentType.DELETE_TASK: {
             if (secondary.taskReference) {
-              const matches = await taskRepo.findByTitle(state.telegramId, secondary.taskReference);
-              if (matches.length > 0) {
-                await taskRepo.deleteTask(matches[0]!._id!.toString());
-                msg = `Deleted "${matches[0]!.title}"`;
+              const delTask = await taskRepo.findById(secondary.taskReference) ?? (await taskRepo.findByTitle(state.telegramId, secondary.taskReference))[0];
+              if (delTask) {
+                await taskRepo.deleteTask(delTask._id!.toString());
+                msg = `Deleted "${delTask.title}"`;
               }
             }
             break;
           }
           case IntentType.MODIFY_TASK: {
             if (secondary.taskReference) {
-              const matches = await taskRepo.findByTitle(state.telegramId, secondary.taskReference);
-              if (matches.length > 0 && secondary.tasks[0]) {
+              const modTask = await taskRepo.findById(secondary.taskReference) ?? (await taskRepo.findByTitle(state.telegramId, secondary.taskReference))[0];
+              if (modTask && secondary.tasks[0]) {
                 const t = secondary.tasks[0];
                 const updates: Record<string, unknown> = {};
                 if (t.title) updates.title = t.title;
@@ -474,24 +478,18 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
                 if (t.priority) updates.priority = t.priority;
                 if (t.estimatedMinutes) updates.estimatedMinutes = t.estimatedMinutes;
                 if (t.preferredTime) updates.preferredTime = t.preferredTime;
-                await taskRepo.updateTask(matches[0]!._id!.toString(), updates);
-                msg = `Updated "${matches[0]!.title}"`;
+                await taskRepo.updateTask(modTask._id!.toString(), updates);
+                msg = `Updated "${modTask.title}"`;
               }
             }
             break;
           }
           case IntentType.COMPLETE_TASK: {
             if (secondary.taskReference) {
-              const schedule = await scheduleRepo.findByDate(state.telegramId, today);
-              if (schedule) {
-                const entry = schedule.entries.find(e =>
-                  e.title.toLowerCase().includes(secondary.taskReference!.toLowerCase())
-                );
-                if (entry) {
-                  entry.status = 'completed' as any;
-                  await schedule.save();
-                  msg = `Completed "${entry.title}"`;
-                }
+              const compTask = await taskRepo.findById(secondary.taskReference) ?? (await taskRepo.findByTitle(state.telegramId, secondary.taskReference))[0];
+              if (compTask) {
+                await taskRepo.updateStatus(compTask._id!.toString(), TaskStatus.COMPLETED);
+                msg = `Completed "${compTask.title}"`;
               }
             }
             break;
