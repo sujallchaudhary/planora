@@ -14,7 +14,7 @@ export async function generateResponseNode(state: AgentState): Promise<Partial<A
   const llm = getLLMProvider();
   const user = await userRepo.findByTelegramId(state.telegramId);
   const config = resolveUserConfig(user?.settings);
-  const now = nowInTimezone(config.timezone);
+  const now = new Date();
 
   const context = {
     telegramId: state.telegramId,

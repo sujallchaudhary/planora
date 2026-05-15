@@ -16,7 +16,8 @@ export async function classifyIntentNode(state: AgentState): Promise<Partial<Age
   const llm = getLLMProvider();
   const user = await userRepo.findByTelegramId(state.telegramId);
   const config = resolveUserConfig(user?.settings);
-  const now = nowInTimezone(config.timezone);
+  const now = new Date();
+  const zonedNow = nowInTimezone(config.timezone);
   const pendingTasks = await taskRepo.findPendingTasks(state.telegramId);
   const pendingCount = pendingTasks.length;
   const pendingTasksList = pendingTasks.map(t => `- ${t.title}`).join('\n');
@@ -31,7 +32,7 @@ export async function classifyIntentNode(state: AgentState): Promise<Partial<Age
     // Late-night aware planning dates
     planningDate: planningDateString(config.timezone, config.lateNightThresholdHour),
     tomorrowDate: tomorrowString(config.timezone, config.lateNightThresholdHour),
-    isLateNight: now.getHours() < config.lateNightThresholdHour,
+    isLateNight: zonedNow.getHours() < config.lateNightThresholdHour,
     pendingTaskCount: pendingCount,
     pendingTasksList: pendingTasksList,
     hasScheduleToday: !!todaySchedule && todaySchedule.entries.length > 0,
