@@ -2,7 +2,7 @@ import type { ITask } from '../memory/mongo/models/task.model.js';
 import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
 import type { UserConfig } from '../config/config-resolver.js';
-import type { PlanningContext } from './planning-context.js';
+import type { PlanningContext } from './planner.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
 import { planSchedule } from './planner.js';
 import { createChildLogger } from '../utils/logger.js';

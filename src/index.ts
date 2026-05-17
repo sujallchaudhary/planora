@@ -1,6 +1,5 @@
 import { env } from './config/env.js';
 import { connectMongoDB, disconnectMongoDB } from './memory/mongo/connection.js';
-import { initQdrantCollections } from './memory/qdrant/client.js';
 import { createBot, startBot, stopBot } from './bot/bot.js';
 import { createServer, startServer } from './server/fastify.js';
 import { startReminderWorker } from './execution/workers/reminder.worker.js';
@@ -16,33 +15,26 @@ async function main() {
   // Step 1: Connect to MongoDB
   await connectMongoDB();
 
-  // Step 2: Initialize Qdrant collections
-  try {
-    await initQdrantCollections();
-  } catch (err) {
-    logger.warn({ err }, 'Qdrant initialization failed — semantic memory will be unavailable');
-  }
-
-  // Step 3: Create Telegram bot
+  // Step 2: Create Telegram bot
   createBot();
 
-  // Step 4: Start BullMQ workers
+  // Step 3: Start BullMQ workers
   const reminderWorker = startReminderWorker();
   const dailyPlanWorker = startDailyPlanWorker();
   const analyticsWorker = startAnalyticsWorker();
 
-  // Step 5: Create and start Fastify server
+  // Step 4: Create and start Fastify server
   const server = await createServer();
   await startServer(server);
 
-  // Step 6: Start Telegram bot (webhook or polling)
+  // Step 5: Start Telegram bot (webhook or polling)
   try {
     await startBot();
   } catch (err) {
     logger.warn({ err }, 'Webhook registration failed — run scripts/set-webhook.sh once DNS is ready.');
   }
 
-  // Step 7: Schedule periodic jobs
+  // Step 6: Schedule periodic jobs
   try {
     await scheduleDailyPlans();
     await scheduleAnalytics();

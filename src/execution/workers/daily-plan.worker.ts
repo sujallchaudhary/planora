@@ -4,9 +4,7 @@ import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
-import { HybridRetriever } from '../../memory/hybrid-retriever.js';
-import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { getStructuredMemory } from '../../memory/hybrid-retriever.js';
 import { planSchedule } from '../../scheduler/planner.js';
 import { syncReminders } from '../job-manager.js';
 import { getBotInstance } from '../../bot/bot.js';
@@ -30,10 +28,7 @@ export function startDailyPlanWorker(): Worker {
       const today = todayString(config.timezone);
       const tasks = await taskRepo.findPendingTasks(telegramId);
 
-      const llm = getLLMProvider();
-      const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));
-      const retriever = new HybridRetriever(semanticMemory);
-      const memory = await retriever.retrieve(telegramId, `Daily plan for ${today}`, config.memoryConfidenceThreshold);
+      const memory = await getStructuredMemory(telegramId, config.memoryConfidenceThreshold);
       const entries = await planSchedule(tasks, memory, config, today);
 
       if (entries.length === 0) {

@@ -10,19 +10,11 @@ import { taskHistoryRepo } from '../../memory/mongo/repositories/task-history.re
 import { resolveUserConfig } from '../../config/config-resolver.js';
 import { ScheduleEntryStatus, TaskStatus } from '../../config/defaults.js';
 import { replan } from '../../scheduler/replanner.js';
-import type { RetrievedMemory } from '../../memory/hybrid-retriever.js';
+import { getStructuredMemory } from '../../memory/hybrid-retriever.js';
 import { formatTimeHuman } from '../../utils/date.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('worker:reminder');
-
-const EMPTY_MEMORY: RetrievedMemory = {
-  preferences: [],
-  habits: [],
-  constraints: [],
-  semanticContext: [],
-  recentHistory: [],
-};
 
 export function startReminderWorker(): Worker {
   const worker = new Worker<ReminderJobData>(
@@ -117,10 +109,11 @@ async function markMissedAndReplan(telegramId: number, date: string, entryId: st
   const config = resolveUserConfig(user.settings);
   const tasks = await taskRepo.findPendingTasks(telegramId);
   const updatedSchedule = await scheduleRepo.findByDate(telegramId, date);
+  const memory = await getStructuredMemory(telegramId, config.memoryConfidenceThreshold);
   const entries = await replan(
     tasks,
     updatedSchedule?.entries ?? [],
-    EMPTY_MEMORY,
+    memory,
     config,
     date,
     {

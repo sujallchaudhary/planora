@@ -1,9 +1,8 @@
 import type { Context } from 'grammy';
-import { runAgent } from '../../agent/graph.js';
+import { runAgent } from '../../agent/agent.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { appendHistory } from '../conversation-history.js';
 import { getPendingAction, clearPendingAction } from '../pending-action.js';
-import { storeConversationTurn } from '../../memory/conversation-memory.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('handler:message');
@@ -53,12 +52,6 @@ export function registerMessageHandler(bot: any): void {
 
       // Save bot response so next message has full context
       appendHistory(from.id, 'assistant', response);
-      void storeConversationTurn({
-        userId: user._id.toString(),
-        telegramId: from.id,
-        userText: inputText,
-        assistantText: response,
-      });
 
       await ctx.reply(response, { parse_mode: 'Markdown' }).catch(() => {
         return ctx.reply(response);

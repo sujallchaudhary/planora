@@ -4,8 +4,7 @@ import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { taskHistoryRepo } from '../../memory/mongo/repositories/task-history.repo.js';
 import { preferenceRepo } from '../../memory/mongo/repositories/preference.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
-import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { storeInsight } from '../../memory/mem0-memory.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('worker:analytics');
@@ -64,20 +63,10 @@ export function startAnalyticsWorker(): Worker {
         log.info({ telegramId, block: worstBlock[0], rate: worstBlock[1].rate }, 'Detected low-success window');
       }
 
-      // Store behavioral insight as semantic memory
+      // Store behavioral insight in Mem0
       try {
-        const llm = getLLMProvider();
-        const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));
         const summary = `Week summary: ${JSON.stringify(stats)}, morning completion: ${(morningRate * 100).toFixed(0)}%, block stats: ${JSON.stringify(blockStats)}`;
-        await semanticMemory.store({
-          userId: user._id.toString(),
-          telegramId,
-          type: 'behavior',
-          content: summary,
-          metadata: { stats, morningRate, blockStats, bestBlock: bestBlock?.[0], worstBlock: worstBlock?.[0] },
-          timestamp: new Date().toISOString(),
-          confidence: 0.8,
-        });
+        await storeInsight(summary, user._id.toString());
       } catch (err) {
         log.warn({ err }, 'Failed to store behavioral insight');
       }

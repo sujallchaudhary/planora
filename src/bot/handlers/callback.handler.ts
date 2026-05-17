@@ -6,6 +6,7 @@ import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
 import { scheduleSnoozeReminder, syncReminders } from '../../execution/job-manager.js';
 import { replan } from '../../scheduler/replanner.js';
+import { getStructuredMemory } from '../../memory/hybrid-retriever.js';
 import { todayString } from '../../utils/date.js';
 import { TaskStatus } from '../../config/defaults.js';
 import { createChildLogger } from '../../utils/logger.js';
@@ -66,9 +67,8 @@ export function registerCallbackHandler(bot: any): void {
         // Trigger replan
         const tasks = await taskRepo.findPendingTasks(from.id);
         const updatedSchedule = await scheduleRepo.findByDate(from.id, today);
-        const newEntries = await replan(tasks, updatedSchedule?.entries ?? [], {
-          preferences: [], habits: [], constraints: [], semanticContext: [], recentHistory: [],
-        }, config, today);
+        const memory = await getStructuredMemory(from.id, config.memoryConfidenceThreshold);
+        const newEntries = await replan(tasks, updatedSchedule?.entries ?? [], memory, config, today);
         const savedSchedule = await scheduleRepo.createOrReplace(from.id, user._id, today, newEntries);
         await syncReminders(from.id, today, savedSchedule.entries);
 

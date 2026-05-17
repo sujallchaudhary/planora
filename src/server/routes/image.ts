@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { extractImageContent } from '../../llm/ai-provider.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('route:image');
@@ -22,8 +22,7 @@ export async function imageRoutes(app: FastifyInstance): Promise<void> {
 
       log.info({ mimeType, size: buffer.length }, 'Processing image');
 
-      const llm = getLLMProvider();
-      const result = await llm.extractImageContent(base64, mimeType);
+      const result = await extractImageContent(base64, mimeType);
 
       return reply.send({
         success: true,

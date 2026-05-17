@@ -5,10 +5,10 @@ config();
 
 const envSchema = z.object({
   // LLM Configuration — Chat/Text
-  LLM_BASE_URL: z.string().url(),
+  LLM_BASE_URL: z.string().url().optional(),
   LLM_API_KEY: z.string().min(1, 'LLM_API_KEY is required'),
-  LLM_CHAT_MODEL: z.string().default('MiniMax-M2.7'),
-  LLM_REASONING_MODEL: z.string().default('MiniMax-M2.7'),
+  LLM_CHAT_MODEL: z.string().default('gpt-4o-mini'),
+  LLM_REASONING_MODEL: z.string().default('gpt-4o-mini'),
   LLM_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
   LLM_MAX_TOKENS: z.coerce.number().positive().default(2048),
 
@@ -31,8 +31,9 @@ const envSchema = z.object({
   // Infrastructure
   MONGODB_URI: z.string().default('mongodb://localhost:27017/assistant'),
   REDIS_URL: z.string().default('redis://localhost:6379'),
-  QDRANT_URL: z.string().default('http://localhost:6333'),
-  QDRANT_API_KEY: z.string().optional().default(''),
+
+  // Mem0 — Memory Management
+  MEM0_API_KEY: z.string().min(1, 'MEM0_API_KEY is required for memory management'),
 
   // Default User Settings
   DEFAULT_TIMEZONE: z.string().default('Asia/Kolkata'),

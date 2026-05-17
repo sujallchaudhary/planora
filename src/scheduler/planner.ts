@@ -1,164 +1,148 @@
-import { addMinutes } from 'date-fns';
+import mongoose from 'mongoose';
+import { generateObject } from 'ai';
+import { z } from 'zod';
+import { reasoningModel } from '../llm/ai-provider.js';
 import type { ITask } from '../memory/mongo/models/task.model.js';
 import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
 import type { UserConfig } from '../config/config-resolver.js';
-import type { PlanningContext } from './planning-context.js';
-import { hasLowEnergy } from './planning-context.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
 import { parseTimeString, formatDateString } from '../utils/date.js';
-import { findAvailableSlots, type TimeSlot, fitsInSlot } from './time-slots.js';
-import { getLLMProvider } from '../llm/openai-compatible.provider.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('planner');
 
-/**
- * Score a task for priority scheduling.
- * Higher score = schedule earlier in the day.
- */
-function scoreTask(task: ITask): number {
-  const priorityWeight = 3;
-  const cognitiveWeight = 2;
-  const urgencyWeight = 2;
+// ─── Planning context (passed by callers to influence scheduling) ──────────────
+export type ScheduleStability = 'preserve' | 'moderate' | 'free';
 
-  let urgency = 1;
-  if (task.dueDate) {
-    const daysUntilDue = Math.max(0, (task.dueDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-    if (daysUntilDue <= 1) urgency = 5;
-    else if (daysUntilDue <= 3) urgency = 3;
-    else if (daysUntilDue <= 7) urgency = 2;
-  }
-
-  return (task.priority * priorityWeight) + (task.cognitiveLoad * cognitiveWeight) + (urgency * urgencyWeight);
+export interface PlanningContext {
+  trigger?: string;
+  reason?: string;
+  energyLevel?: number; // 1 = depleted, 5 = high energy
+  recoveryMinutes?: number;
+  scheduleStability?: ScheduleStability;
 }
 
-function blockWindow(
-  block: 'morning' | 'afternoon' | 'evening' | 'night' | 'any',
-  workingStart: Date,
-  workingEnd: Date,
-): { idealStart: Date; idealEnd: Date } {
-  if (block === 'any') return { idealStart: workingStart, idealEnd: workingEnd };
+// ─── Zod schema for the LLM-generated schedule ────────────────────────────────
+const ScheduleOutputSchema = z.object({
+  entries: z.array(z.object({
+    taskId: z.string().nullable().describe('MongoDB _id of the task, if this entry corresponds to a task. null for habits/constraints/breaks.'),
+    title: z.string(),
+    description: z.string().describe('Brief description of the entry'),
+    startTime: z.string().describe('Start time in HH:mm format'),
+    endTime: z.string().describe('End time in HH:mm format'),
+    priority: z.number().min(1).max(5).describe('1=low, 5=critical'),
+    isFixed: z.boolean().describe('Whether this entry has a fixed time slot'),
+    flexibility: z.number().min(0).max(1).describe('0 = immovable, 1 = very flexible'),
+  })),
+  reasoning: z.string().describe('Brief explanation of the scheduling strategy'),
+});
 
-  const start = new Date(workingStart);
-  const end = new Date(workingStart);
-
-  if (block === 'morning') {
-    start.setHours(6, 0, 0, 0);
-    end.setHours(12, 0, 0, 0);
-  } else if (block === 'afternoon') {
-    start.setHours(12, 0, 0, 0);
-    end.setHours(17, 0, 0, 0);
-  } else if (block === 'evening') {
-    start.setHours(17, 0, 0, 0);
-    end.setHours(22, 0, 0, 0);
-  } else {
-    start.setHours(20, 0, 0, 0);
-    end.setHours(23, 59, 0, 0);
-  }
-
-  const idealStart = start > workingStart ? start : workingStart;
-  const idealEnd = end < workingEnd ? end : workingEnd;
-  return idealStart < idealEnd
-    ? { idealStart, idealEnd }
-    : { idealStart: workingStart, idealEnd: workingEnd };
-}
-
-function inferBlockFromText(value: string | undefined): 'morning' | 'afternoon' | 'evening' | 'night' | null {
-  if (!value) return null;
-  const text = value.toLowerCase();
-  if (text.includes('late night') || text.includes('night')) return 'night';
-  if (text.includes('evening')) return 'evening';
-  if (text.includes('afternoon')) return 'afternoon';
-  if (text.includes('morning')) return 'morning';
-  return null;
-}
-
-function getPreference(memory: RetrievedMemory, key: string): string | undefined {
-  return memory.preferences.find(p => p.key === key)?.value;
-}
-
-function getLearnedFocusBlock(memory: RetrievedMemory): 'morning' | 'afternoon' | 'evening' | 'night' | null {
-  return inferBlockFromText(getPreference(memory, 'peak_focus_window'))
-    ?? inferBlockFromText(getPreference(memory, 'deep_work_time'))
-    ?? inferBlockFromText(getPreference(memory, 'study_time'));
-}
-
-function getLowSuccessBlock(memory: RetrievedMemory): 'morning' | 'afternoon' | 'evening' | 'night' | null {
-  return inferBlockFromText(getPreference(memory, 'low_success_window'))
-    ?? (getPreference(memory, 'morning_task_difficulty') === 'high' ? 'morning' : null);
-}
-
-/**
- * Determine preferred time window for a task based on cognitive load and user preferences.
- */
-function getPreferredWindow(
-  task: ITask,
+// ─── Prompt builder ────────────────────────────────────────────────────────────
+function buildPlannerPrompt(
+  tasks: ITask[],
   memory: RetrievedMemory,
-  workingStart: Date,
-  workingEnd: Date,
-  planningContext?: PlanningContext,
-): { idealStart: Date; idealEnd: Date } {
-  const explicitTaskBlock = inferBlockFromText(task.preferredTime);
-  if (explicitTaskBlock) {
-    return blockWindow(explicitTaskBlock, workingStart, workingEnd);
-  }
+  config: UserConfig,
+  targetDate: string,
+  planningContext: PlanningContext = {},
+): string {
+  const now = new Date();
+  const currentHour = now.getHours();
+  const currentMinute = now.getMinutes();
+  const currentTimeStr = `${String(currentHour).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}`;
 
-  const learnedFocusBlock = getLearnedFocusBlock(memory);
-  const lowSuccessBlock = getLowSuccessBlock(memory);
+  const taskList = tasks.map(t => {
+    const daysUntilDue = t.dueDate
+      ? Math.max(0, Math.ceil((t.dueDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
+      : null;
+    const urgency = daysUntilDue !== null
+      ? (daysUntilDue <= 1 ? '🔴 DUE TODAY/TOMORROW' : daysUntilDue <= 3 ? '🟡 DUE SOON' : `📅 ${daysUntilDue}d away`)
+      : '';
+    const fixed = t.isFixed && t.fixedStartTime && t.fixedEndTime
+      ? ` | FIXED: ${t.fixedStartTime}–${t.fixedEndTime}`
+      : '';
+    const preferred = t.preferredTime ? ` | Preferred: ${t.preferredTime}` : '';
+    return `  - [ID: ${t._id}] "${t.title}" | Priority: ${t.priority}/5 | Cognitive: ${t.cognitiveLoad}/3 | ${t.estimatedMinutes}min${fixed}${preferred} ${urgency}`;
+  }).join('\n');
 
-  if (task.cognitiveLoad >= 3 && hasLowEnergy(planningContext)) {
-    const later = new Date(workingStart);
-    later.setHours(Math.max(later.getHours() + 2, 16), 0, 0, 0);
-    return { idealStart: later < workingEnd ? later : workingStart, idealEnd: workingEnd };
-  }
+  const constraintList = memory.constraints.filter(c => c.isActive).map(c => {
+    const dayOfWeek = new Date(targetDate + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
+    const isApplicable = c.days.includes('daily') || c.days.includes(dayOfWeek);
+    if (!isApplicable) return null;
 
-  if (task.cognitiveLoad >= 2 && learnedFocusBlock && learnedFocusBlock !== lowSuccessBlock) {
-    return blockWindow(learnedFocusBlock, workingStart, workingEnd);
-  }
-
-  if (task.cognitiveLoad >= 3 && lowSuccessBlock === 'morning') {
-    return blockWindow('evening', workingStart, workingEnd);
-  }
-
-  // Check if user has deep work time preference
-  const deepWorkPref = memory.preferences.find(p => p.key === 'deep_work_time');
-
-  if (task.cognitiveLoad >= 3) {
-    // High cognitive load → morning by default, or user preference
-    if (deepWorkPref?.value === 'evening') {
-      const evening = new Date(workingStart);
-      evening.setHours(18, 0, 0, 0);
-      return { idealStart: evening, idealEnd: workingEnd };
+    // Skip full-day constraints (00:00–23:59 or similar) — they block everything and make planning useless.
+    // Instead, mention them as context but not as hard blockers.
+    const isFullDay = (c.timeRange.start === '00:00' && (c.timeRange.end === '23:59' || c.timeRange.end === '23:00'));
+    if (isFullDay) {
+      return `  - ${c.key}: ${c.description || c.key} (all day — for context only, still schedule tasks around other commitments)`;
     }
-    // Default: morning window
-    const morningEnd = new Date(workingStart);
-    morningEnd.setHours(12, 0, 0, 0);
-    return { idealStart: workingStart, idealEnd: morningEnd };
+
+    return `  - ${c.key}: ${c.description || c.key} (${c.timeRange.start}–${c.timeRange.end}) [BLOCKED — cannot schedule tasks here]`;
+  }).filter(Boolean).join('\n');
+
+  const habitList = memory.habits.filter(h => h.isActive).map(h => {
+    const dayOfWeek = new Date(targetDate + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
+    const isApplicable = h.days.includes('daily') || h.days.includes(dayOfWeek);
+    if (!isApplicable) return null;
+
+    // Full-day habits (00:00–23:59) are just labels, not real time blocks — treat as context
+    const isFullDay = (h.timeRange.start === '00:00' && (h.timeRange.end === '23:59' || h.timeRange.end === '23:00'));
+    if (isFullDay) {
+      return `  - ${h.key}: ${h.description || h.key} (ongoing — weave into schedule as appropriate)`;
+    }
+
+    return `  - ${h.key}: ${h.description || h.key} (${h.timeRange.start}–${h.timeRange.end})`;
+  }).filter(Boolean).join('\n');
+
+  const prefList = memory.preferences.map(p => `  - ${p.key}: ${p.value}`).join('\n');
+
+  let energyNote = '';
+  if (planningContext.energyLevel !== undefined) {
+    if (planningContext.energyLevel <= 1) energyNote = '\n⚠️ USER IS EXHAUSTED. Start with a recovery break. Push hard tasks later. Reduce total load.';
+    else if (planningContext.energyLevel <= 2) energyNote = '\n⚠️ USER IS TIRED. Add a recovery break at the start. Avoid heavy cognitive work early.';
+    else if (planningContext.energyLevel >= 5) energyNote = '\n💪 User is highly energized. Front-load the hardest tasks.';
+  }
+  if (planningContext.recoveryMinutes) {
+    energyNote += `\nInclude a ${planningContext.recoveryMinutes}-minute "Recovery break" at the start before scheduling tasks.`;
   }
 
-  if (task.cognitiveLoad <= 1) {
-    // Low cognitive load → afternoon/evening
-    const afternoonStart = new Date(workingStart);
-    afternoonStart.setHours(14, 0, 0, 0);
-    return { idealStart: afternoonStart, idealEnd: workingEnd };
-  }
+  return `You are an expert personal productivity planner. Create a precise, minute-level schedule for the user's day.
 
-  // Medium → any time
-  return { idealStart: workingStart, idealEnd: workingEnd };
+## Context
+- Date: ${targetDate}
+- Current time: ${currentTimeStr} (do NOT schedule anything before this time)
+- Working hours: ${config.workingHours.start} to ${config.workingHours.end}
+- Buffer between tasks: ${config.bufferMinutes} minutes
+- Leave ~${config.slackPercentage}% of time unscheduled as slack/flexibility${energyNote}
+
+## Tasks to Schedule
+${taskList || '  (none)'}
+
+## Constraints (Fixed Blocked Time — MUST include, CANNOT overlap)
+${constraintList || '  (none)'}
+
+## Habits (Recurring Routines — include at their times)
+${habitList || '  (none)'}
+
+## User Preferences
+${prefList || '  (none)'}
+
+## Rules (STRICTLY FOLLOW)
+1. NEVER schedule before ${currentTimeStr} or outside working hours (${config.workingHours.start}–${config.workingHours.end}).
+2. Include ALL constraints and habits at their specified times. Mark them as isFixed: true, flexibility: 0.
+3. Fixed tasks (with FIXED times) MUST be placed at their exact times. Mark as isFixed: true, flexibility: 0.
+4. URGENCY IS #1 PRIORITY. Tasks due sooner go earlier in the day.
+5. Place high cognitive load (3/3) tasks when the user is freshest (typically morning), unless preferences say otherwise.
+6. Place low cognitive load (1/3) tasks in afternoon/evening.
+7. Add ${config.bufferMinutes}-minute gaps between tasks.
+8. After any task ≥50min with cognitive load 3/3, add a 10-15min "Recovery break".
+9. Leave ~${config.slackPercentage}% of total working time unscheduled.
+10. Times must be in HH:mm format, entries must not overlap.
+11. For task entries, include the taskId. For habits, constraints, and breaks, set taskId to null.
+12. Sort entries chronologically.`;
 }
 
-/**
- * Core deterministic scheduling algorithm.
- * 
- * Algorithm:
- * 1. Lock fixed constraints (classes, meetings)
- * 2. Lock habits (daily nap, gym) at their preferred times
- * 3. Score remaining tasks by priority × urgency × cognitive_demand
- * 4. Allocate high-cognitive tasks into optimal time windows
- * 5. Fill remaining slots with lower-priority tasks
- * 6. Insert buffers and leave slack time
- */
+// ─── Core planner: LLM generates the full schedule ────────────────────────────
 export async function planSchedule(
   tasks: ITask[],
   memory: RetrievedMemory,
@@ -166,269 +150,82 @@ export async function planSchedule(
   targetDate: string,
   planningContext: PlanningContext = {},
 ): Promise<IScheduleEntry[]> {
-  const entries: IScheduleEntry[] = [];
-
-  const [y, m, d] = targetDate.split('-').map(Number);
-  const baseDateUTC = new Date(Date.UTC(y!, m! - 1, d!));
-
+  const now = new Date();
   const workingStart = parseTimeString(config.workingHours.start, targetDate, config.timezone);
   const workingEnd = parseTimeString(config.workingHours.end, targetDate, config.timezone);
-
-  // Use the later of working hours start or current time for flexible task scheduling
-  // This prevents scheduling tasks in the past (e.g. at 11:41 AM, don't schedule at 8 AM)
-  const now = new Date();
   const effectiveStart = now > workingStart ? now : workingStart;
 
-  log.info({ targetDate, tasks: tasks.length, effectiveStart: effectiveStart.toISOString() }, 'Planning schedule');
+  log.info({ targetDate, tasks: tasks.length, effectiveStart: effectiveStart.toISOString() }, 'Planning schedule via LLM');
 
-  // Guard: check if there's any working time left for flexible tasks
-  const hasTimeRemaining = effectiveStart < workingEnd;
-
-  // Request Schedule Blueprint from LLM — only if there are tasks AND time remaining
-  let blueprint = null;
-  if (tasks.length > 0 && hasTimeRemaining) {
-    blueprint = await getLLMProvider().generateScheduleBlueprint(tasks, memory, config, targetDate);
+  // Guard: no time remaining
+  if (effectiveStart >= workingEnd) {
+    log.info({ targetDate }, 'Past working hours — nothing to schedule');
+    return [];
   }
 
-  // Step 1: Lock fixed constraints
-  const occupiedSlots: TimeSlot[] = [];
+  // If no tasks AND no habits/constraints for the day, return empty
+  const dayOfWeek = new Date(targetDate + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
+  const activeHabits = memory.habits.filter(h => h.isActive && (h.days.includes('daily') || h.days.includes(dayOfWeek)));
+  const activeConstraints = memory.constraints.filter(c => c.isActive && (c.days.includes('daily') || c.days.includes(dayOfWeek)));
 
-  /** Convert snake_case key to Title Case for display */
-  const prettyKey = (key: string) =>
-    key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-
-  if (hasTimeRemaining && hasLowEnergy(planningContext) && planningContext.recoveryMinutes) {
-    const recoveryStart = effectiveStart;
-    const recoveryEnd = addMinutes(recoveryStart, planningContext.recoveryMinutes);
-    const clampedRecoveryEnd = recoveryEnd < workingEnd ? recoveryEnd : workingEnd;
-
-    if (clampedRecoveryEnd.getTime() - recoveryStart.getTime() >= 10 * 60 * 1000) {
-      occupiedSlots.push({ start: recoveryStart, end: clampedRecoveryEnd });
-      entries.push({
-        title: 'Recovery reset',
-        description: planningContext.reason ?? 'Low-energy recovery window before resuming planned work.',
-        startTime: recoveryStart,
-        endTime: clampedRecoveryEnd,
-        status: ScheduleEntryStatus.SCHEDULED,
-        priority: 4,
-        isFixed: false,
-        flexibility: 0.4,
-      } as IScheduleEntry);
-    }
+  if (tasks.length === 0 && activeHabits.length === 0 && activeConstraints.length === 0) {
+    log.info({ targetDate }, 'No tasks, habits, or constraints — empty schedule');
+    return [];
   }
 
-  for (const constraint of memory.constraints) {
-    const dayOfWeek = baseDateUTC.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
-    const isApplicable = constraint.days.includes('daily') || constraint.days.includes(dayOfWeek);
-
-    if (isApplicable && constraint.isActive) {
-      const start = parseTimeString(constraint.timeRange.start, targetDate, config.timezone);
-      const end = parseTimeString(constraint.timeRange.end, targetDate, config.timezone);
-      
-      const isAllDay = constraint.timeRange.start === '00:00' && constraint.timeRange.end === '23:59';
-      if (!isAllDay) {
-        occupiedSlots.push({ start, end });
-        entries.push({
-          title: prettyKey(constraint.key),
-          description: constraint.description,
-          startTime: start,
-          endTime: end,
-          status: ScheduleEntryStatus.SCHEDULED,
-          priority: 5,
-          isFixed: true,
-          flexibility: 0,
-        } as IScheduleEntry);
-      }
-    }
-  }
-
-  // Step 2: Lock habits
-  for (const habit of memory.habits) {
-    const dayOfWeek = baseDateUTC.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
-    const isApplicable = habit.days.includes('daily') || habit.days.includes(dayOfWeek);
-
-    if (isApplicable && habit.isActive) {
-      const start = parseTimeString(habit.timeRange.start, targetDate, config.timezone);
-      const end = parseTimeString(habit.timeRange.end, targetDate, config.timezone);
-      
-      const isAllDay = habit.timeRange.start === '00:00' && habit.timeRange.end === '23:59';
-      if (!isAllDay) {
-        occupiedSlots.push({ start, end });
-        entries.push({
-          title: prettyKey(habit.key),
-          description: habit.description,
-          startTime: start,
-          endTime: end,
-          status: ScheduleEntryStatus.SCHEDULED,
-          priority: 3,
-          isFixed: false,
-          flexibility: 0.3,
-        } as IScheduleEntry);
-      }
-    }
-  }
-
-  // Step 3: Filter tasks and lock fixed-time tasks for TODAY
+  // Filter tasks: fixed tasks for other dates shouldn't be scheduled today
   const validTasks = tasks.filter(t => {
-    // If a task is fixed and has a specific date, it MUST match the targetDate
     if (t.isFixed && t.dueDate) {
-      const taskDateStr = formatDateString(t.dueDate, config.timezone);
-      if (taskDateStr !== targetDate) {
-        return false;
-      }
+      return formatDateString(t.dueDate, config.timezone) === targetDate;
     }
-    // For flexible tasks, we could also filter them out if their due date is in the future
-    // and we only want to do them ON that date, but for now we leave them to be scheduled
-    // if there is free time, unless they are specifically fixed for another day.
     return true;
   });
 
-  const fixedTasks = validTasks.filter(t => t.isFixed && t.fixedStartTime && t.fixedEndTime);
-  const flexibleTasks = validTasks.filter(t => !t.isFixed);
+  const prompt = buildPlannerPrompt(validTasks, memory, config, targetDate, planningContext);
 
-  for (const task of fixedTasks) {
-    const start = parseTimeString(task.fixedStartTime!, targetDate, config.timezone);
-    const end = parseTimeString(task.fixedEndTime!, targetDate, config.timezone);
-    
-    const isAllDay = task.fixedStartTime === '00:00' && task.fixedEndTime === '23:59';
-    const isPast = end <= now;
-    
-    if (!isAllDay && !isPast) {
-      occupiedSlots.push({ start, end });
-      entries.push({
-        taskId: task._id,
-        title: task.title,
-        description: task.description,
-        startTime: start,
-        endTime: end,
-        status: ScheduleEntryStatus.SCHEDULED,
-        priority: task.priority,
-        isFixed: true,
-        flexibility: 0,
-      } as IScheduleEntry);
-    } else if (isPast) {
-      log.debug({ task: task.title, end: end.toISOString() }, 'Skipping fixed task — already past');
-    }
+  try {
+    const { object } = await generateObject({
+      model: reasoningModel,
+      schema: ScheduleOutputSchema,
+      system: prompt,
+      prompt: 'Generate the complete schedule now.',
+      temperature: 0.2,
+    });
+
+    log.info({ entries: object.entries.length, reasoning: object.reasoning }, 'LLM generated schedule');
+
+    // Convert LLM output to IScheduleEntry[]
+    const entries: IScheduleEntry[] = object.entries
+      .map(e => {
+        const startTime = parseTimeString(e.startTime, targetDate, config.timezone);
+        const endTime = parseTimeString(e.endTime, targetDate, config.timezone);
+
+        // Skip entries in the past
+        if (endTime <= now) return null;
+        // Skip entries outside working hours
+        if (startTime >= workingEnd) return null;
+
+        return {
+          taskId: e.taskId ? new mongoose.Types.ObjectId(e.taskId) : undefined,
+          title: e.title,
+          description: e.description,
+          startTime,
+          endTime,
+          status: ScheduleEntryStatus.SCHEDULED,
+          priority: e.priority,
+          isFixed: e.isFixed,
+          flexibility: e.flexibility,
+        } as IScheduleEntry;
+      })
+      .filter((e): e is IScheduleEntry => e !== null);
+
+    // Sort chronologically
+    entries.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
+
+    log.info({ entries: entries.length }, 'Schedule planned');
+    return entries;
+  } catch (error) {
+    log.error({ error }, 'LLM schedule generation failed — returning empty schedule');
+    return [];
   }
-
-  // Step 4: Sort flexible tasks
-  // Use AI blueprint order if available, otherwise fallback to score
-  const scoredTasks = flexibleTasks.map(t => {
-    const blueprintTask = blueprint?.tasks.find(bt => bt.taskId === t._id?.toString());
-    // Give blueprint tasks higher base priority to ensure they are scheduled first in the order the AI provided
-    const blueprintScore = blueprintTask ? 1000 - blueprint!.tasks.indexOf(blueprintTask) : 0;
-    return { task: t, score: blueprintScore > 0 ? blueprintScore : scoreTask(t), blueprint: blueprintTask };
-  });
-  scoredTasks.sort((a, b) => b.score - a.score);
-
-  // Calculate slack time to leave
-  const totalWorkingMinutes = hasTimeRemaining ? (workingEnd.getTime() - effectiveStart.getTime()) / (60 * 1000) : 0;
-  const slackMinutes = totalWorkingMinutes * (config.slackPercentage / 100);
-  let allocatedFlexMinutes = 0;
-  const maxFlexMinutes = totalWorkingMinutes - slackMinutes;
-
-  // Step 5: Allocate flexible tasks into available slots (only if time remains)
-  if (!hasTimeRemaining) {
-    log.info({ targetDate }, 'Past working hours — skipping flexible task allocation');
-  }
-  for (const taskData of scoredTasks) {
-    if (!hasTimeRemaining) break;
-    const { task } = taskData;
-    if (allocatedFlexMinutes >= maxFlexMinutes) {
-      log.debug({ task: task.title }, 'Slack limit reached, skipping task');
-      break;
-    }
-
-    // Add buffer to occupied slots for gap calculation
-    const bufferedSlots = occupiedSlots.map(s => ({
-      start: s.start,
-      end: addMinutes(s.end, config.bufferMinutes),
-    }));
-
-    const availableSlots = findAvailableSlots(bufferedSlots, effectiveStart, workingEnd, task.estimatedMinutes);
-    
-    // Determine preferred window
-    let preferred = getPreferredWindow(task, memory, effectiveStart, workingEnd, planningContext);
-    
-    // Override with AI blueprint if available
-    if (taskData.blueprint && taskData.blueprint.assignedBlock !== 'any') {
-      const startHour = taskData.blueprint.assignedBlock === 'morning' ? 0 : taskData.blueprint.assignedBlock === 'afternoon' ? 12 : 17;
-      const endHour = taskData.blueprint.assignedBlock === 'morning' ? 12 : taskData.blueprint.assignedBlock === 'afternoon' ? 17 : 24;
-      
-      const blockStart = new Date(workingStart);
-      blockStart.setHours(startHour, 0, 0, 0);
-      const blockEnd = new Date(workingStart);
-      blockEnd.setHours(endHour, 0, 0, 0);
-      
-      const clampedStart = blockStart > workingStart ? blockStart : workingStart;
-      const clampedEnd = blockEnd < workingEnd ? blockEnd : workingEnd;
-      
-      // Constrain within actual working hours
-      preferred = {
-        idealStart: clampedStart < clampedEnd ? clampedStart : workingStart,
-        idealEnd: clampedStart < clampedEnd ? clampedEnd : workingEnd,
-      };
-    }
-
-    // Try to find a slot in the preferred window first
-    let bestSlot: TimeSlot | null = null;
-    for (const slot of availableSlots) {
-      if (fitsInSlot(slot, task.estimatedMinutes)) {
-        // Prefer slots that overlap with the ideal window
-        if (slot.start >= preferred.idealStart && slot.start < preferred.idealEnd) {
-          bestSlot = slot;
-          break;
-        }
-        if (!bestSlot) {
-          bestSlot = slot;
-        }
-      }
-    }
-
-    if (bestSlot) {
-      const taskStart = bestSlot.start;
-      const taskEnd = addMinutes(taskStart, task.estimatedMinutes);
-
-      occupiedSlots.push({ start: taskStart, end: taskEnd });
-      allocatedFlexMinutes += task.estimatedMinutes;
-
-      entries.push({
-        taskId: task._id,
-        title: task.title,
-        description: task.description,
-        startTime: taskStart,
-        endTime: taskEnd,
-        status: ScheduleEntryStatus.SCHEDULED,
-        priority: task.priority,
-        isFixed: false,
-        flexibility: 0.7,
-      } as IScheduleEntry);
-
-      if (task.cognitiveLoad >= 3 && task.estimatedMinutes >= 50) {
-        const breakMinutes = Math.max(10, Math.min(20, config.bufferMinutes));
-        const breakEnd = addMinutes(taskEnd, breakMinutes);
-        if (breakEnd <= workingEnd) {
-          occupiedSlots.push({ start: taskEnd, end: breakEnd });
-          entries.push({
-            title: 'Recovery break',
-            description: 'Short buffer after deep work to reduce context-switching fatigue.',
-            startTime: taskEnd,
-            endTime: breakEnd,
-            status: ScheduleEntryStatus.SCHEDULED,
-            priority: 2,
-            isFixed: false,
-            flexibility: 0.8,
-          } as IScheduleEntry);
-        }
-      }
-    } else {
-      log.debug({ task: task.title }, 'No available slot found');
-    }
-  }
-
-  // Sort entries by start time
-  entries.sort((a, b) => a.startTime.getTime() - b.startTime.getTime());
-
-  log.info({ entries: entries.length, allocatedMinutes: allocatedFlexMinutes }, 'Schedule planned');
-  return entries;
 }

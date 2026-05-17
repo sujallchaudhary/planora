@@ -6,9 +6,7 @@ import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
 import { planSchedule } from '../../scheduler/planner.js';
 import { syncReminders } from '../../execution/job-manager.js';
-import { HybridRetriever } from '../../memory/hybrid-retriever.js';
-import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { getStructuredMemory } from '../../memory/hybrid-retriever.js';
 import { todayString, formatTimeHuman } from '../../utils/date.js';
 import { scheduleDailyPlans } from '../../execution/workers/daily-plan.worker.js';
 import { createChildLogger } from '../../utils/logger.js';
@@ -73,10 +71,7 @@ export function registerCommandHandlers(bot: any): void {
 
     const tasks = await taskRepo.findPendingTasks(from.id);
 
-    const llm = getLLMProvider();
-    const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));
-    const retriever = new HybridRetriever(semanticMemory);
-    const memory = await retriever.retrieve(from.id, `Daily plan for ${today}`, config.memoryConfidenceThreshold);
+    const memory = await getStructuredMemory(from.id, config.memoryConfidenceThreshold);
     const entries = await planSchedule(tasks, memory, config, today);
     const schedule = await scheduleRepo.createOrReplace(from.id, user._id, today, entries);
     await syncReminders(from.id, today, schedule.entries);
