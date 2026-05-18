@@ -7,7 +7,7 @@ import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
 import type { UserConfig } from '../config/config-resolver.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
-import { parseTimeString, formatDateString } from '../utils/date.js';
+import { parseTimeString, formatDateString, nowInTimezone } from '../utils/date.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('planner');
@@ -46,14 +46,14 @@ function buildPlannerPrompt(
   targetDate: string,
   planningContext: PlanningContext = {},
 ): string {
-  const now = new Date();
+  const now = nowInTimezone(config.timezone);
   const currentHour = now.getHours();
   const currentMinute = now.getMinutes();
   const currentTimeStr = `${String(currentHour).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}`;
 
   const taskList = tasks.map(t => {
     const daysUntilDue = t.dueDate
-      ? Math.max(0, Math.ceil((t.dueDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
+      ? Math.max(0, Math.ceil((t.dueDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)))
       : null;
     const urgency = daysUntilDue !== null
       ? (daysUntilDue <= 1 ? '🔴 DUE TODAY/TOMORROW' : daysUntilDue <= 3 ? '🟡 DUE SOON' : `📅 ${daysUntilDue}d away`)
@@ -65,8 +65,10 @@ function buildPlannerPrompt(
     return `  - [ID: ${t._id}] "${t.title}" | Priority: ${t.priority}/5 | Cognitive: ${t.cognitiveLoad}/3 | ${t.estimatedMinutes}min${fixed}${preferred} ${urgency}`;
   }).join('\n');
 
+  // Compute day of week in user's timezone (targetDate is already a local date string like 2026-05-18)
+  const dayOfWeek = new Date(targetDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+
   const constraintList = memory.constraints.filter(c => c.isActive).map(c => {
-    const dayOfWeek = new Date(targetDate + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
     const isApplicable = c.days.includes('daily') || c.days.includes(dayOfWeek);
     if (!isApplicable) return null;
 
@@ -81,7 +83,6 @@ function buildPlannerPrompt(
   }).filter(Boolean).join('\n');
 
   const habitList = memory.habits.filter(h => h.isActive).map(h => {
-    const dayOfWeek = new Date(targetDate + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
     const isApplicable = h.days.includes('daily') || h.days.includes(dayOfWeek);
     if (!isApplicable) return null;
 
@@ -139,7 +140,7 @@ ${prefList || '  (none)'}
 9. Leave ~${config.slackPercentage}% of total working time unscheduled.
 10. Times must be in HH:mm format, entries must not overlap.
 11. For task entries, include the taskId. For habits, constraints, and breaks, set taskId to null.
-12. Sort entries chronologically.`;
+12. Sort entries chronologically.${planningContext.reason ? `\n\n## Replan Context\nThe user requested a replan: "${planningContext.reason}". Adjust the schedule to accommodate this.` : ''}`;
 }
 
 // ─── Core planner: LLM generates the full schedule ────────────────────────────
@@ -150,7 +151,7 @@ export async function planSchedule(
   targetDate: string,
   planningContext: PlanningContext = {},
 ): Promise<IScheduleEntry[]> {
-  const now = new Date();
+  const now = nowInTimezone(config.timezone);
   const workingStart = parseTimeString(config.workingHours.start, targetDate, config.timezone);
   const workingEnd = parseTimeString(config.workingHours.end, targetDate, config.timezone);
   const effectiveStart = now > workingStart ? now : workingStart;
@@ -164,9 +165,9 @@ export async function planSchedule(
   }
 
   // If no tasks AND no habits/constraints for the day, return empty
-  const dayOfWeek = new Date(targetDate + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' }).toLowerCase();
-  const activeHabits = memory.habits.filter(h => h.isActive && (h.days.includes('daily') || h.days.includes(dayOfWeek)));
-  const activeConstraints = memory.constraints.filter(c => c.isActive && (c.days.includes('daily') || c.days.includes(dayOfWeek)));
+  const planDayOfWeek = new Date(targetDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+  const activeHabits = memory.habits.filter(h => h.isActive && (h.days.includes('daily') || h.days.includes(planDayOfWeek)));
+  const activeConstraints = memory.constraints.filter(c => c.isActive && (c.days.includes('daily') || c.days.includes(planDayOfWeek)));
 
   if (tasks.length === 0 && activeHabits.length === 0 && activeConstraints.length === 0) {
     log.info({ targetDate }, 'No tasks, habits, or constraints — empty schedule');

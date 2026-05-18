@@ -24,7 +24,7 @@ interface ToolContext {
   today: string;
 }
 
-async function triggerReplan(ctx: ToolContext, targetDate: string): Promise<number> {
+async function triggerReplan(ctx: ToolContext, targetDate: string, reason?: string): Promise<number> {
   try {
     const tasks = await taskRepo.findPendingTasks(ctx.telegramId);
     const existingSchedule = await scheduleRepo.findByDate(ctx.telegramId, targetDate);
@@ -36,6 +36,10 @@ async function triggerReplan(ctx: ToolContext, targetDate: string): Promise<numb
       memory,
       ctx.config,
       targetDate,
+      {
+        trigger: 'user_request',
+        reason,
+      },
     );
 
     const schedule = await scheduleRepo.createOrReplace(ctx.telegramId, ctx.userId, targetDate, newEntries);
@@ -93,7 +97,7 @@ export function createAgentTools(ctx: ToolContext) {
           : ctx.today;
         const datesToReplan = Array.from(new Set([ctx.today, replanTarget]));
         for (const d of datesToReplan) {
-          await triggerReplan(ctx, d);
+          await triggerReplan(ctx, d, `New tasks added: ${created.map(c => c.title).join(', ')}`);
         }
 
         return { success: true, message: `Added ${created.length} task(s): ${created.map(c => c.title).join(', ')}. Schedule updated.`, tasks: created };
@@ -141,7 +145,7 @@ export function createAgentTools(ctx: ToolContext) {
         } else if (task.dueDate) {
           replanTarget = task.dueDate.toISOString().split('T')[0]!;
         }
-        await triggerReplan(ctx, replanTarget);
+        await triggerReplan(ctx, replanTarget, `Task "${task.title}" modified`);
 
         return { success: true, message: `Updated "${task.title}". Schedule adjusted.` };
       },
@@ -159,7 +163,7 @@ export function createAgentTools(ctx: ToolContext) {
         }
 
         await taskRepo.deleteTask(task._id!.toString());
-        await triggerReplan(ctx, ctx.today);
+        await triggerReplan(ctx, ctx.today, `Task "${task.title}" deleted — freed capacity`);
 
         return { success: true, message: `Deleted "${task.title}". Schedule updated.` };
       },
@@ -187,7 +191,7 @@ export function createAgentTools(ctx: ToolContext) {
               }
             }
           }
-          await triggerReplan(ctx, ctx.today);
+          await triggerReplan(ctx, ctx.today, 'Task(s) completed — freed time');
           return { success: true, message: `Marked ${count} task(s) as completed ✅. Schedule updated.` };
         }
 
@@ -217,7 +221,7 @@ export function createAgentTools(ctx: ToolContext) {
           }
         }
 
-        await triggerReplan(ctx, ctx.today);
+        await triggerReplan(ctx, ctx.today, `Task "${task.title}" completed — freed time`);
         return { success: true, message: `Marked "${task.title}" as completed ✅. Schedule updated.` };
       },
     }),
@@ -276,7 +280,7 @@ export function createAgentTools(ctx: ToolContext) {
           }
         }
 
-        await triggerReplan(ctx, ctx.today);
+        await triggerReplan(ctx, ctx.today, `Task "${taskTitle}" skipped — redistribute time`);
         return { success: true, message: `Skipped "${taskTitle}". Rest of the day replanned.` };
       },
     }),
@@ -328,7 +332,7 @@ export function createAgentTools(ctx: ToolContext) {
       }),
       execute: async ({ date, reason }) => {
         const targetDate = date ?? ctx.today;
-        const count = await triggerReplan(ctx, targetDate);
+        const count = await triggerReplan(ctx, targetDate, reason);
         const dateLabel = targetDate === ctx.today ? 'your day' : targetDate;
 
         return {
@@ -384,7 +388,7 @@ export function createAgentTools(ctx: ToolContext) {
           { upsert: true, new: true },
         );
 
-        await triggerReplan(ctx, ctx.today);
+        await triggerReplan(ctx, ctx.today, `New habit "${key}" blocks ${startTime}–${endTime}`);
         return { success: true, message: `Habit saved: ${key} (${startTime}–${endTime}, ${days.join(', ')}). Schedule updated.` };
       },
     }),
@@ -415,7 +419,7 @@ export function createAgentTools(ctx: ToolContext) {
           { upsert: true, new: true },
         );
 
-        await triggerReplan(ctx, ctx.today);
+        await triggerReplan(ctx, ctx.today, `New constraint "${key}" blocks ${startTime}–${endTime}`);
         return { success: true, message: `Constraint saved: ${key} (${startTime}–${endTime}, ${days.join(', ')}). Schedule updated.` };
       },
     }),

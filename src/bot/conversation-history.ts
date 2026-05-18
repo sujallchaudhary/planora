@@ -9,7 +9,7 @@ export interface ChatMessage {
   content: string;
 }
 
-const MAX_HISTORY = 6; // 3 user + 3 assistant turns
+const MAX_HISTORY = 16; // 8 user + 8 assistant turns
 
 // Map<telegramId, messages>
 const store = new Map<number, ChatMessage[]>();
