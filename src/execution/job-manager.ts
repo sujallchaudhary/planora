@@ -1,4 +1,4 @@
-import { getReminderQueue } from './queue.js';
+import { getReminderQueue, getRedisConnection } from './queue.js';
 import type { IScheduleEntry } from '../memory/mongo/models/schedule.model.js';
 import { userRepo } from '../memory/mongo/repositories/user.repo.js';
 import { resolveUserConfig } from '../config/config-resolver.js';
@@ -8,6 +8,8 @@ import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('job-manager');
 
+export type ReminderType = 'pre_reminder' | 'start_reminder' | 'snooze_reminder' | 'follow_up' | 'escalation';
+
 export interface ReminderJobData {
   telegramId: number;
   date: string;
@@ -16,13 +18,23 @@ export interface ReminderJobData {
   description: string;
   startTime: string;
   endTime: string;
-  type: 'pre_reminder' | 'start_reminder' | 'snooze_reminder' | 'follow_up' | 'escalation';
+  type: ReminderType;
   escalationLevel?: number;
 }
 
+const JOB_OPTS = {
+  attempts: 3,
+  backoff: { type: 'exponential' as const, delay: 5000 },
+  removeOnComplete: { count: 200 },
+  removeOnFail: { age: 86400 },
+};
+
+const jobSetKey = (telegramId: number, date: string) => `memora:reminder_jobs:${telegramId}:${date}`;
+
 /**
  * Sync reminder jobs for a schedule.
- * Cancels all existing jobs for this user+date and creates new ones.
+ * Removes every job previously registered for this user+date (tracked in a Redis set,
+ * so this is O(jobs for that day), not O(all jobs in the queue)) and creates new ones.
  */
 export async function syncReminders(
   telegramId: number,
@@ -30,135 +42,69 @@ export async function syncReminders(
   entries: IScheduleEntry[],
 ): Promise<void> {
   const queue = getReminderQueue();
+  const redis = getRedisConnection();
   const user = await userRepo.findByTelegramId(telegramId);
   const config = resolveUserConfig(user?.settings);
+  const setKey = jobSetKey(telegramId, date);
 
-  // Cancel existing reminders for this user+date
-  const jobPrefix = `reminder_${telegramId}_${date}`;
-
-  // Get all delayed, waiting, and active jobs to remove matching ones
-  const scheduled = await queue.getJobs(['delayed', 'waiting', 'active', 'prioritized']);
-  for (const job of scheduled) {
-    if (job.id?.startsWith(jobPrefix)) {
-      await job.remove();
+  const previous = await redis.smembers(setKey);
+  for (const jobId of previous) {
+    try {
+      const job = await queue.getJob(jobId);
+      if (job) await job.remove();
+    } catch (err: any) {
+      // Active jobs cannot be removed; the worker re-checks entry state before sending anyway.
+      log.debug({ jobId, err: err?.message }, 'Could not remove reminder job');
     }
   }
+  await redis.del(setKey);
 
-  // Create new reminder jobs for each entry
+  const created: string[] = [];
+  const add = async (type: ReminderType, entry: IScheduleEntry, entryId: string, fireAt: Date, escalationLevel?: number) => {
+    const delay = msUntil(fireAt);
+    if (delay <= 0) return;
+    const jobId = `reminder_${telegramId}_${date}_${entryId}_${type}`;
+    await queue.add(
+      type,
+      {
+        telegramId,
+        date,
+        entryId,
+        title: entry.title,
+        description: entry.description,
+        startTime: new Date(entry.startTime).toISOString(),
+        endTime: new Date(entry.endTime).toISOString(),
+        type,
+        escalationLevel,
+      } satisfies ReminderJobData,
+      { ...JOB_OPTS, jobId, delay },
+    );
+    created.push(jobId);
+  };
+
   for (const entry of entries) {
     if (entry.status !== 'scheduled') continue;
-
-    const entryId = (entry as any)._id?.toString() ?? '';
+    const entryId = entry._id?.toString() ?? '';
     if (!entryId) continue;
 
     const startTime = new Date(entry.startTime);
     const endTime = new Date(entry.endTime);
-    const preReminderTime = addMinutes(startTime, -config.reminderLeadMinutes);
 
-    // Pre-reminder (X minutes before)
-    const preDelay = msUntil(preReminderTime);
-    if (preDelay > 0) {
-      const preJobId = `${jobPrefix}_${entryId}_pre`;
-      await queue.add(
-        'pre_reminder',
-        {
-          telegramId,
-          date,
-          entryId,
-          title: entry.title,
-          description: entry.description,
-          startTime: entry.startTime.toISOString(),
-          endTime: entry.endTime.toISOString(),
-          type: 'pre_reminder',
-        } satisfies ReminderJobData,
-        {
-          jobId: preJobId,
-          delay: preDelay,
-          removeOnComplete: { count: 100 },
-          removeOnFail: { age: 86400 },
-        }
-      );
-    }
-
-    // Start reminder (at task start time)
-    const startDelay = msUntil(startTime);
-    if (startDelay > 0) {
-      const startJobId = `${jobPrefix}_${entryId}_start`;
-      await queue.add(
-        'start_reminder',
-        {
-          telegramId,
-          date,
-          entryId,
-          title: entry.title,
-          description: entry.description,
-          startTime: entry.startTime.toISOString(),
-          endTime: entry.endTime.toISOString(),
-          type: 'start_reminder',
-        } satisfies ReminderJobData,
-        {
-          jobId: startJobId,
-          delay: startDelay,
-          removeOnComplete: { count: 100 },
-          removeOnFail: { age: 86400 },
-        }
-      );
-    }
+    await add('pre_reminder', entry, entryId, addMinutes(startTime, -config.reminderLeadMinutes));
+    await add('start_reminder', entry, entryId, startTime);
 
     if (entry.taskId) {
-      const followUpTime = addMinutes(endTime, Math.max(5, Math.floor(config.bufferMinutes / 2)));
-      const followDelay = msUntil(followUpTime);
-      if (followDelay > 0) {
-        await queue.add(
-          'follow_up',
-          {
-            telegramId,
-            date,
-            entryId,
-            title: entry.title,
-            description: entry.description,
-            startTime: entry.startTime.toISOString(),
-            endTime: entry.endTime.toISOString(),
-            type: 'follow_up',
-            escalationLevel: 1,
-          } satisfies ReminderJobData,
-          {
-            jobId: `${jobPrefix}_${entryId}_follow`,
-            delay: followDelay,
-            removeOnComplete: { count: 100 },
-            removeOnFail: { age: 86400 },
-          }
-        );
-      }
-
-      const escalationTime = addMinutes(endTime, Math.max(30, config.snoozeMinutes * 2));
-      const escalationDelay = msUntil(escalationTime);
-      if (escalationDelay > 0) {
-        await queue.add(
-          'escalation',
-          {
-            telegramId,
-            date,
-            entryId,
-            title: entry.title,
-            description: entry.description,
-            startTime: entry.startTime.toISOString(),
-            endTime: entry.endTime.toISOString(),
-            type: 'escalation',
-            escalationLevel: 2,
-          } satisfies ReminderJobData,
-          {
-            jobId: `${jobPrefix}_${entryId}_escalation`,
-            delay: escalationDelay,
-            removeOnComplete: { count: 100 },
-            removeOnFail: { age: 86400 },
-          }
-        );
-      }
+      await add('follow_up', entry, entryId, addMinutes(endTime, Math.max(5, Math.floor(config.bufferMinutes / 2))), 1);
+      await add('escalation', entry, entryId, addMinutes(endTime, Math.max(30, config.snoozeMinutes * 2)), 2);
     }
   }
 
-  log.info({ telegramId, date, entries: entries.length }, 'Synced reminders');
+  if (created.length > 0) {
+    await redis.sadd(setKey, ...created);
+    await redis.expire(setKey, 3 * 24 * 3600);
+  }
+
+  log.info({ telegramId, date, entries: entries.length, jobs: created.length }, 'Synced reminders');
 }
 
 export async function scheduleSnoozeReminder(
@@ -168,9 +114,10 @@ export async function scheduleSnoozeReminder(
   snoozeMinutes: number,
 ): Promise<void> {
   const queue = getReminderQueue();
-  const entryId = (entry as any)._id?.toString() ?? '';
+  const entryId = entry._id?.toString() ?? '';
   if (!entryId) return;
 
+  const jobId = `reminder_${telegramId}_${date}_${entryId}_snooze_${Date.now()}`;
   await queue.add(
     'snooze_reminder',
     {
@@ -179,15 +126,11 @@ export async function scheduleSnoozeReminder(
       entryId,
       title: entry.title,
       description: entry.description,
-      startTime: entry.startTime.toISOString(),
-      endTime: entry.endTime.toISOString(),
+      startTime: new Date(entry.startTime).toISOString(),
+      endTime: new Date(entry.endTime).toISOString(),
       type: 'snooze_reminder',
     } satisfies ReminderJobData,
-    {
-      jobId: `reminder_${telegramId}_${date}_${entryId}_snooze_${Date.now()}`,
-      delay: snoozeMinutes * 60 * 1000,
-      removeOnComplete: { count: 100 },
-      removeOnFail: { age: 86400 },
-    }
+    { ...JOB_OPTS, jobId, delay: snoozeMinutes * 60 * 1000 },
   );
+  await getRedisConnection().sadd(jobSetKey(telegramId, date), jobId);
 }

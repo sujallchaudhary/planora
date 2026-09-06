@@ -1,6 +1,11 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { TaskStatus, Priority, CognitiveLoad } from '../../../config/defaults.js';
 
+export interface ITaskRecurrence {
+  pattern: 'daily' | 'weekdays' | 'weekly';
+  days?: string[];
+}
+
 export interface ITask extends Document {
   userId: mongoose.Types.ObjectId;
   telegramId: number;
@@ -16,10 +21,13 @@ export interface ITask extends Document {
   isFixed: boolean;
   fixedStartTime?: string;
   fixedEndTime?: string;
-  recurrence?: {
-    pattern: string;  // daily, weekly, weekdays, etc.
-    days?: string[];
-  };
+  recurrence?: ITaskRecurrence;
+  /** yyyy-MM-dd — the task is not eligible for scheduling before this date (skip / roll-over). */
+  deferredUntil?: string;
+  /** Count of times the task was skipped or missed — used for procrastination detection. */
+  deferCount: number;
+  completedAt?: Date;
+  actualMinutes?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -44,11 +52,14 @@ const taskSchema = new Schema<ITask>(
       pattern: { type: String },
       days: [{ type: String }],
     },
+    deferredUntil: { type: String },
+    deferCount: { type: Number, default: 0 },
+    completedAt: { type: Date },
+    actualMinutes: { type: Number },
   },
   { timestamps: true }
 );
 
-// Compound index for efficient queries
 taskSchema.index({ telegramId: 1, status: 1 });
 taskSchema.index({ telegramId: 1, dueDate: 1 });
 

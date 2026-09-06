@@ -1,5 +1,6 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { env } from '../../config/env.js';
+import { getEmbeddingDimensions } from '../../llm/index.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('qdrant');
@@ -20,7 +21,7 @@ export const MEMORY_COLLECTION = 'memory_vectors';
 
 export async function initQdrantCollections(): Promise<void> {
   const qdrant = getQdrantClient();
-  const requiredSize = env.EMBEDDING_DIMENSIONS;
+  const requiredSize = getEmbeddingDimensions();
 
   try {
     const collections = await qdrant.getCollections();

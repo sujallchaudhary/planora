@@ -1,5 +1,5 @@
 import { SemanticMemory } from './qdrant/semantic-memory.js';
-import { getLLMProvider } from '../llm/openai-compatible.provider.js';
+import { getLLMProvider } from '../llm/index.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('conversation-memory');
@@ -20,6 +20,7 @@ export async function storeConversationTurn(input: {
       telegramId: input.telegramId,
       type: 'conversation',
       content,
+      embedText: input.userText,
       metadata: {
         userText: input.userText,
         assistantText: input.assistantText,

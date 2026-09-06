@@ -1,71 +1,78 @@
 import { z } from 'zod';
-import { IntentType, MemoryType, Priority, CognitiveLoad, TaskStatus } from '../config/defaults.js';
+import { IntentType, MemoryType, Priority, CognitiveLoad } from '../config/defaults.js';
+
+// ─── Shared task shape extracted by the LLM ────────────────────────────────────
+const RecurrenceSchema = z.object({
+  pattern: z.enum(['daily', 'weekdays', 'weekly']),
+  days: z.array(z.string()).nullish(),
+}).nullish();
+
+export const ExtractedTaskSchema = z.object({
+  /** Required for ADD_TASK; MODIFY_TASK payloads may carry only the changed fields. */
+  title: z.string().nullish(),
+  description: z.string().nullish().default(''),
+  priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
+  cognitiveLoad: z.nativeEnum(CognitiveLoad).nullish().default(CognitiveLoad.MEDIUM),
+  estimatedMinutes: z.number().min(5).nullish().default(30),
+  dueDate: z.string().nullish(),
+  preferredTime: z.string().nullish(),
+  tags: z.array(z.string()).nullish().default([]),
+  isFixed: z.boolean().nullish().default(false),
+  fixedStartTime: z.string().nullish(),
+  fixedEndTime: z.string().nullish(),
+  recurrence: RecurrenceSchema,
+});
+
+export type ExtractedTask = z.infer<typeof ExtractedTaskSchema>;
+
+export const MemorySignalSchema = z.object({
+  type: z.nativeEnum(MemoryType),
+  key: z.string().min(1),
+  value: z.string(),
+  timeRange: z.object({
+    start: z.string().nullish(),
+    end: z.string().nullish(),
+    days: z.array(z.string()).nullish(),
+  }).nullish(),
+  /** yyyy-MM-dd — for temporary constraints like "exams until the 20th" */
+  until: z.string().nullish(),
+  confidence: z.number().min(0).max(1),
+});
+
+export type MemorySignal = z.infer<typeof MemorySignalSchema>;
+
+export const UserStateSchema = z.object({
+  energy: z.enum(['depleted', 'low', 'normal', 'high']).nullish(),
+  mood: z.string().nullish(),
+  /** e.g. "away from desk until 15:00", "free all afternoon" */
+  availability: z.string().nullish(),
+  /** yyyy-MM-dd or HH:mm the user says they are unavailable until, if any */
+  unavailableUntil: z.string().nullish(),
+  note: z.string().nullish(),
+}).nullish();
+
+export type UserState = z.infer<typeof UserStateSchema>;
+
+const IntentPayloadSchema = z.object({
+  intent: z.nativeEnum(IntentType),
+  tasks: z.array(ExtractedTaskSchema).default([]),
+  taskReference: z.string().nullish(),
+  memoryReference: z.string().nullish(),
+  replanContext: z.string().nullish(),
+  targetDate: z.string().nullish(),
+});
+
+export type IntentPayload = z.infer<typeof IntentPayloadSchema>;
 
 // ─── Intent Classification + Task Extraction + Memory Extraction (single LLM call) ─
-export const ClassificationResultSchema = z.object({
-  intent: z.nativeEnum(IntentType),
+export const ClassificationResultSchema = IntentPayloadSchema.extend({
   confidence: z.number().min(0).max(1),
-
-  // Extracted tasks (if any)
-  tasks: z.array(z.object({
-    title: z.string(),
-    description: z.string().nullish().default(''),
-    priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
-    cognitiveLoad: z.nativeEnum(CognitiveLoad).nullish().default(CognitiveLoad.MEDIUM),
-    estimatedMinutes: z.number().min(5).nullish().default(30),
-    dueDate: z.string().nullish(),
-    preferredTime: z.string().nullish(),
-    tags: z.array(z.string()).nullish().default([]),
-    isFixed: z.boolean().nullish().default(false),
-    fixedStartTime: z.string().nullish(),
-    fixedEndTime: z.string().nullish(),
-  })).default([]),
-
-  // Extracted memory signals (if any)
-  memorySignals: z.array(z.object({
-    type: z.nativeEnum(MemoryType),
-    key: z.string(),
-    value: z.string(),
-    timeRange: z.object({
-      start: z.string().nullish(),
-      end: z.string().nullish(),
-      days: z.array(z.string()).nullish(),
-    }).nullish(),
-    confidence: z.number().min(0).max(1),
-  })).default([]),
-
-  // For MODIFY/DELETE/COMPLETE/SKIP intents — which task is being referenced
-  taskReference: z.string().nullish(),
-
-  // For REPLAN — reason/context
-  replanContext: z.string().nullish(),
-
-  // For REPLAN / SHOW_PLAN — specific date (YYYY-MM-DD) if user asked for "tomorrow", "Friday", etc.
-  targetDate: z.string().nullish(),
-
-  // Secondary intents for compound messages (e.g. "add gym and delete math")
-  secondaryIntents: z.array(z.object({
-    intent: z.nativeEnum(IntentType),
-    tasks: z.array(z.object({
-      title: z.string(),
-      description: z.string().nullish().default(''),
-      priority: z.nativeEnum(Priority).nullish().default(Priority.MEDIUM),
-      cognitiveLoad: z.nativeEnum(CognitiveLoad).nullish().default(CognitiveLoad.MEDIUM),
-      estimatedMinutes: z.number().min(5).nullish().default(30),
-      dueDate: z.string().nullish(),
-      preferredTime: z.string().nullish(),
-      tags: z.array(z.string()).nullish().default([]),
-      isFixed: z.boolean().nullish().default(false),
-      fixedStartTime: z.string().nullish(),
-      fixedEndTime: z.string().nullish(),
-    })).default([]),
-    taskReference: z.string().nullish(),
-    replanContext: z.string().nullish(),
-    targetDate: z.string().nullish(),
-  })).default([]),
-
-  // Raw reasoning from LLM
+  memorySignals: z.array(MemorySignalSchema).default([]),
+  userState: UserStateSchema,
+  secondaryIntents: z.array(IntentPayloadSchema).default([]),
   reasoning: z.string().nullish(),
+  /** Set by the provider when the LLM call itself failed — never by the model. */
+  classificationError: z.string().nullish(),
 });
 
 export type ClassificationResult = z.infer<typeof ClassificationResultSchema>;
@@ -89,23 +96,14 @@ export const ImageExtractionResultSchema = z.object({
 
 export type ImageExtractionResult = z.infer<typeof ImageExtractionResultSchema>;
 
-// ─── Response Generation ───────────────────────────────────────────────────────
-export const ResponseGenerationSchema = z.object({
-  message: z.string(),
-  suggestedActions: z.array(z.string()).optional().default([]),
-});
-
-export type ResponseGeneration = z.infer<typeof ResponseGenerationSchema>;
-
 // ─── Schedule Blueprint Generation ──────────────────────────────────────────────
 export const ScheduleBlueprintSchema = z.object({
   tasks: z.array(z.object({
     taskId: z.string(),
-    assignedBlock: z.enum(['morning', 'afternoon', 'evening', 'any']),
-    reasoning: z.string(),
+    assignedBlock: z.enum(['morning', 'afternoon', 'evening', 'night', 'any']),
+    reasoning: z.string().nullish().default(''),
   })),
-  globalReasoning: z.string(),
+  globalReasoning: z.string().nullish().default(''),
 });
 
 export type ScheduleBlueprint = z.infer<typeof ScheduleBlueprintSchema>;
-

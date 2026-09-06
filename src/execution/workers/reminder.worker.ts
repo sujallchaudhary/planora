@@ -1,6 +1,6 @@
 import { Worker } from 'bullmq';
 import { getRedisConnection, QUEUE_NAMES } from '../queue.js';
-import { syncReminders, type ReminderJobData } from '../job-manager.js';
+import type { ReminderJobData } from '../job-manager.js';
 import { getBotInstance } from '../../bot/bot.js';
 import { buildTaskKeyboard } from '../../bot/keyboards/task.keyboard.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
@@ -9,72 +9,86 @@ import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { taskHistoryRepo } from '../../memory/mongo/repositories/task-history.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
 import { ScheduleEntryStatus, TaskStatus } from '../../config/defaults.js';
-import { replan } from '../../scheduler/replanner.js';
-import type { RetrievedMemory } from '../../memory/hybrid-retriever.js';
-import { formatTimeHuman } from '../../utils/date.js';
+import { replanDay } from '../../scheduler/replan-service.js';
+import { formatTimeHuman, addDaysToDateString } from '../../utils/date.js';
+import { md } from '../../utils/markdown.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('worker:reminder');
 
-const EMPTY_MEMORY: RetrievedMemory = {
-  preferences: [],
-  habits: [],
-  constraints: [],
-  semanticContext: [],
-  recentHistory: [],
-};
+const RESOLVED = [ScheduleEntryStatus.COMPLETED, ScheduleEntryStatus.SKIPPED, ScheduleEntryStatus.MISSED] as string[];
 
 export function startReminderWorker(): Worker {
   const worker = new Worker<ReminderJobData>(
     QUEUE_NAMES.REMINDERS,
     async (job) => {
-      const { telegramId, date, title, description, startTime, endTime, type, entryId } = job.data;
-      log.info({ telegramId, title, type }, 'Processing reminder');
+      const { telegramId, date, startTime, endTime, type, entryId } = job.data;
+      log.info({ telegramId, title: job.data.title, type }, 'Processing reminder');
 
       const bot = getBotInstance();
       const user = await userRepo.findByTelegramId(telegramId);
       const config = resolveUserConfig(user?.settings);
       const schedule = await scheduleRepo.findByDate(telegramId, date);
-      const entry = schedule?.entries.find((e: any) => e._id.toString() === entryId);
+      const entry = schedule?.entries.find(e => e._id?.toString() === entryId);
 
       if (!entry) {
         log.info({ telegramId, entryId }, 'Reminder entry no longer exists');
         return;
       }
-
-      if ([ScheduleEntryStatus.COMPLETED, ScheduleEntryStatus.SKIPPED, ScheduleEntryStatus.MISSED].includes(entry.status as ScheduleEntryStatus)) {
+      if (RESOLVED.includes(entry.status)) {
         log.info({ telegramId, entryId, status: entry.status }, 'Skipping reminder for resolved entry');
         return;
       }
-
-      const startStr = formatTimeHuman(new Date(startTime), config.timezone);
-      const endStr = formatTimeHuman(new Date(endTime), config.timezone);
-
-      let message: string;
-      if (type === 'pre_reminder') {
-        message = `Coming up in ${config.reminderLeadMinutes} min:\n\n*${title}*\n${startStr} - ${endStr}`;
-      } else if (type === 'follow_up') {
-        message = `Quick check-in:\n\n*${title}*\nPlanned ${startStr} - ${endStr}\n\nStill working on it, or should I adjust the day?`;
-      } else if (type === 'escalation') {
-        message = `I did not see an update for:\n\n*${title}*\nPlanned ${startStr} - ${endStr}\n\nI am marking it missed for now and reshaping the remaining schedule.`;
-        await markMissedAndReplan(telegramId, date, entryId);
-      } else if (type === 'snooze_reminder') {
-        message = `Snooze ended:\n\n*${title}*\n${startStr} - ${endStr}`;
-      } else {
-        message = `Time to start:\n\n*${title}*\n${startStr} - ${endStr}`;
-        await scheduleRepo.updateEntryStatus(telegramId, date, entryId, ScheduleEntryStatus.ACTIVE);
+      // The task may have been completed from another day's schedule or deleted.
+      if (entry.taskId) {
+        const task = await taskRepo.findById(entry.taskId.toString());
+        if (!task || task.status === TaskStatus.COMPLETED || task.status === TaskStatus.SKIPPED) {
+          await scheduleRepo.updateEntryStatus(telegramId, date, entryId, task ? ScheduleEntryStatus.COMPLETED : ScheduleEntryStatus.SKIPPED);
+          log.info({ telegramId, entryId }, 'Task already resolved elsewhere — reminder suppressed');
+          return;
+        }
       }
 
-      if (description) message += `\n${description}`;
+      const title = md(entry.title);
+      const startStr = formatTimeHuman(new Date(startTime), config.timezone);
+      const endStr = formatTimeHuman(new Date(endTime), config.timezone);
+      let message: string;
+      let withKeyboard = true;
 
-      await bot.api.sendMessage(telegramId, message, {
-        parse_mode: 'Markdown',
-        reply_markup: buildTaskKeyboard(entryId, config.snoozeMinutes),
-      });
+      switch (type) {
+        case 'pre_reminder':
+          message = `Heads up — in ${config.reminderLeadMinutes} min:\n\n*${title}*\n${startStr} – ${endStr}`;
+          withKeyboard = false;
+          break;
+        case 'follow_up':
+          message = `Quick check-in on *${title}* (planned ${startStr} – ${endStr}).\nDone, still on it, or should I move it?`;
+          break;
+        case 'escalation':
+          message = await handleEscalation(telegramId, date, entryId, config.timezone);
+          withKeyboard = false;
+          break;
+        case 'snooze_reminder':
+          message = `Snooze is up — back to *${title}*?`;
+          break;
+        default:
+          message = `Time to start:\n\n*${title}*\n${startStr} – ${endStr}`;
+          await scheduleRepo.updateEntryStatus(telegramId, date, entryId, ScheduleEntryStatus.ACTIVE);
+          if (entry.taskId) await taskRepo.updateStatus(entry.taskId.toString(), TaskStatus.ACTIVE);
+      }
+
+      if (entry.description && type !== 'escalation') message += `\n_${md(entry.description)}_`;
+
+      const opts = withKeyboard ? { parse_mode: 'Markdown' as const, reply_markup: buildTaskKeyboard(entryId, config.snoozeMinutes) } : { parse_mode: 'Markdown' as const };
+      try {
+        await bot.api.sendMessage(telegramId, message, opts);
+      } catch (err: any) {
+        log.warn({ err: err?.message }, 'Markdown send failed — retrying as plain text');
+        await bot.api.sendMessage(telegramId, message.replace(/[*_\\]/g, ''), withKeyboard ? { reply_markup: buildTaskKeyboard(entryId, config.snoozeMinutes) } : {});
+      }
     },
     {
       connection: getRedisConnection(),
-      removeOnComplete: { count: 100 },
+      removeOnComplete: { count: 200 },
       removeOnFail: { age: 7 * 24 * 3600 },
       concurrency: 5,
     }
@@ -88,48 +102,49 @@ export function startReminderWorker(): Worker {
   return worker;
 }
 
-async function markMissedAndReplan(telegramId: number, date: string, entryId: string): Promise<void> {
+/**
+ * No response 30+ minutes after the slot ended: record it as missed, keep the task open,
+ * and re-fit it later today — or roll it to tomorrow if the day is out of room.
+ */
+async function handleEscalation(telegramId: number, date: string, entryId: string, timezone: string): Promise<string> {
   const user = await userRepo.findByTelegramId(telegramId);
-  if (!user) return;
+  if (!user) return 'I lost track of this task.';
 
   const schedule = await scheduleRepo.findByDate(telegramId, date);
-  const entry = schedule?.entries.find((e: any) => e._id.toString() === entryId);
-  if (!entry || entry.status === ScheduleEntryStatus.COMPLETED || entry.status === ScheduleEntryStatus.SKIPPED) {
-    return;
-  }
+  const entry = schedule?.entries.find(e => e._id?.toString() === entryId);
+  if (!entry || RESOLVED.includes(entry.status)) return '';
 
   await scheduleRepo.updateEntryStatus(telegramId, date, entryId, ScheduleEntryStatus.MISSED);
+  const title = md(entry.title);
 
-  if (entry.taskId) {
-    await taskRepo.updateStatus(entry.taskId.toString(), TaskStatus.MISSED);
-    await taskHistoryRepo.record({
-      userId: user._id,
-      telegramId,
-      taskId: entry.taskId,
-      title: entry.title,
-      scheduledDate: date,
-      scheduledStartTime: entry.startTime,
-      scheduledEndTime: entry.endTime,
-      outcome: 'missed',
-    });
+  if (!entry.taskId) {
+    return `Looks like *${title}* didn't happen. No problem — I've noted it.`;
   }
 
-  const config = resolveUserConfig(user.settings);
-  const tasks = await taskRepo.findPendingTasks(telegramId);
-  const updatedSchedule = await scheduleRepo.findByDate(telegramId, date);
-  const entries = await replan(
-    tasks,
-    updatedSchedule?.entries ?? [],
-    EMPTY_MEMORY,
-    config,
-    date,
-    {
-      trigger: 'missed_task_escalation',
-      reason: `Missed ${entry.title}`,
-      scheduleStability: 'preserve',
-    },
-  );
+  await taskRepo.markMissedButOpen(entry.taskId.toString());
+  await taskHistoryRepo.record({
+    userId: user._id as any,
+    telegramId,
+    taskId: entry.taskId,
+    title: entry.title,
+    scheduledDate: date,
+    scheduledStartTime: entry.startTime,
+    scheduledEndTime: entry.endTime,
+    outcome: 'missed',
+  });
 
-  const saved = await scheduleRepo.createOrReplace(telegramId, user._id, date, entries);
-  await syncReminders(telegramId, date, saved.entries);
+  const outcome = await replanDay(telegramId, date, {
+    trigger: 'missed_task_escalation',
+    reason: `Missed ${entry.title}`,
+    scheduleStability: 'preserve',
+  });
+
+  const moved = outcome.entries.find(e => e.taskId?.toString() === entry.taskId?.toString() && e.status === ScheduleEntryStatus.SCHEDULED);
+  if (moved) {
+    return `I didn't hear back on *${title}*, so I've moved it to ${formatTimeHuman(new Date(moved.startTime), timezone)}. If you already did it, just tell me.`;
+  }
+
+  const tomorrow = addDaysToDateString(date, 1);
+  await taskRepo.deferTask(entry.taskId.toString(), tomorrow);
+  return `I didn't hear back on *${title}* and there's no room left today, so it's first in line for tomorrow. If you already did it, just say so.`;
 }

@@ -45,6 +45,7 @@ export async function startBot(): Promise<void> {
     { command: 'plan',     description: 'Generate today\'s schedule' },
     { command: 'schedule', description: 'View schedule with action buttons' },
     { command: 'status',   description: 'See today\'s progress' },
+    { command: 'memory',   description: 'What Memora has learned about you' },
     { command: 'clear',    description: 'Clear today\'s schedule' },
     { command: 'help',     description: 'Show all commands and usage' },
   ]);

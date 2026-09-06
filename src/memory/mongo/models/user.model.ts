@@ -34,6 +34,7 @@ const userSchema = new Schema<IUser>(
       snoozeMinutes: { type: Number },
       memoryConfidenceThreshold: { type: Number },
       memoryMinDataPoints: { type: Number },
+      lateNightThresholdHour: { type: Number },
     },
     isActive: { type: Boolean, default: true },
     lastInteraction: { type: Date, default: Date.now },

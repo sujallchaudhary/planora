@@ -4,20 +4,21 @@ import type { RetrievedMemory } from '../memory/hybrid-retriever.js';
 import type { UserConfig } from '../config/config-resolver.js';
 import type { PlanningContext } from './planning-context.js';
 import { ScheduleEntryStatus } from '../config/defaults.js';
-import { planSchedule } from './planner.js';
+import { planSchedule, type PlanResult } from './planner.js';
+import type { TimeSlot } from './time-slots.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('replanner');
 
 /**
- * Partial replanner — minimally adjusts the existing schedule.
- * 
- * Rules:
- * - Only adjusts entries AFTER the current time
- * - Preserves completed/active entries
- * - Removes skipped entries
- * - Replans remaining entries using the planner algorithm
- * - Stability: won't replan more than once per configured frequency
+ * Partial replanner — minimally adjusts an existing schedule.
+ *
+ * - Completed, active and past entries are kept as a record.
+ * - Fixed / low-flexibility future entries are kept unless stability is 'free'.
+ * - Skipped entries are dropped and their task is excluded for the day.
+ * - Missed entries are kept as a record but their task is re-fitted later in the day.
+ * - Everything kept is passed to the planner as pre-occupied time, so new entries
+ *   are placed *around* it instead of being silently dropped.
  */
 export async function replan(
   tasks: ITask[],
@@ -26,65 +27,87 @@ export async function replan(
   config: UserConfig,
   targetDate: string,
   planningContext: PlanningContext = {},
-): Promise<IScheduleEntry[]> {
+): Promise<PlanResult> {
   const now = new Date();
+  const keepStable = planningContext.scheduleStability !== 'free';
 
-  log.info({ targetDate, existingEntries: existingEntries.length }, 'Starting partial replan');
-
-  // Preserve entries that are completed, active, fixed, low-flexibility, or in the past.
-  // This keeps autonomous replans from unnecessarily reshuffling the whole day.
   const preserved: IScheduleEntry[] = [];
-  const taskIdsToExclude = new Set<string>();
-  const preserveStableFuture = planningContext.scheduleStability !== 'free';
+  const excludeTaskIds = new Set<string>();
+  const preoccupied: TimeSlot[] = [];
 
   for (const entry of existingEntries) {
-    const isPast = new Date(entry.endTime) <= now;
-    const isCompleted = entry.status === ScheduleEntryStatus.COMPLETED;
-    const isActive = entry.status === ScheduleEntryStatus.ACTIVE;
-    const isSkipped = entry.status === ScheduleEntryStatus.SKIPPED;
-    const isStableFuture = preserveStableFuture && !isPast && !isSkipped && (
-      entry.isFixed || entry.flexibility <= 0.35 || !entry.taskId
-    );
+    const start = new Date(entry.startTime);
+    const end = new Date(entry.endTime);
+    const isPast = end <= now;
+    const taskId = entry.taskId ? entry.taskId.toString() : null;
 
-    if (isCompleted || isActive || isPast || isStableFuture) {
-      preserved.push(entry);
-      if (entry.taskId) {
-        taskIdsToExclude.add(entry.taskId.toString());
-      }
-    } else if (isSkipped) {
-      // Don't preserve skipped entries, but exclude their tasks
-      if (entry.taskId) {
-        taskIdsToExclude.add(entry.taskId.toString());
+    switch (entry.status) {
+      case ScheduleEntryStatus.SKIPPED:
+        if (taskId) excludeTaskIds.add(taskId);
+        continue;
+
+      case ScheduleEntryStatus.MISSED:
+        preserved.push(entry); // keep the record, but let the task be re-fitted
+        continue;
+
+      case ScheduleEntryStatus.COMPLETED:
+        preserved.push(entry);
+        if (taskId) excludeTaskIds.add(taskId);
+        if (end > now) preoccupied.push({ start, end });
+        continue;
+
+      case ScheduleEntryStatus.ACTIVE:
+        preserved.push(entry);
+        if (taskId) excludeTaskIds.add(taskId);
+        // Someone is working on this right now — keep the slot (and a little tail if it overran).
+        preoccupied.push({ start, end: end > now ? end : new Date(now.getTime() + 15 * 60_000) });
+        continue;
+
+      default: {
+        // scheduled
+        if (isPast) {
+          if (taskId) {
+            // Never started and the slot is gone: treat as missed so it gets re-fitted.
+            preserved.push({ ...(toPlain(entry)), status: ScheduleEntryStatus.MISSED });
+          } else {
+            preserved.push(entry);
+          }
+          continue;
+        }
+        const stable = keepStable && (entry.isFixed || entry.flexibility <= 0.35);
+        if (stable) {
+          preserved.push(entry);
+          if (taskId) excludeTaskIds.add(taskId);
+          preoccupied.push({ start, end });
+        }
+        // Flexible future entries are simply re-planned.
       }
     }
-    // Scheduled entries after current time will be replanned
   }
 
-  // Filter out tasks that are already handled
-  const remainingTasks = tasks.filter(t => !taskIdsToExclude.has(t._id!.toString()));
+  const remainingTasks = tasks.filter(t => !excludeTaskIds.has(String(t._id)));
 
-  // Replan only remaining tasks
-  const newEntries = await planSchedule(remainingTasks, memory, config, targetDate, planningContext);
+  log.info({ targetDate, existing: existingEntries.length, preserved: preserved.length, remainingTasks: remainingTasks.length }, 'Starting partial replan');
 
-  // Filter new entries to only include those after current time and avoid stable preserved blocks.
-  const futureNewEntries = newEntries.filter(e => {
-    if (new Date(e.startTime) <= now) return false;
-    return !preserved.some(p => {
-      const stable = p.isFixed || p.flexibility <= 0.35 || !p.taskId;
-      if (!stable) return false;
-      return new Date(e.startTime) < new Date(p.endTime) && new Date(p.startTime) < new Date(e.endTime);
-    });
+  const result = await planSchedule(remainingTasks, memory, config, targetDate, planningContext, { preoccupied, now });
+
+  // Safety net: the planner already avoids preoccupied slots, but never let two live entries overlap.
+  const liveFuture = preserved.filter(p => new Date(p.endTime) > now && p.status !== ScheduleEntryStatus.MISSED);
+  const safeNew = result.entries.filter(e => {
+    const clash = liveFuture.some(p => new Date(e.startTime) < new Date(p.endTime) && new Date(p.startTime) < new Date(e.endTime));
+    if (clash) log.warn({ title: e.title }, 'Dropped overlapping entry during replan');
+    return !clash;
   });
 
-  // Merge preserved + new future entries
-  const merged = [...preserved, ...futureNewEntries];
+  const merged = [...preserved, ...safeNew];
   merged.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
 
-  log.info({
-    preserved: preserved.length,
-    newEntries: futureNewEntries.length,
-    total: merged.length,
-  }, 'Partial replan complete');
+  log.info({ preserved: preserved.length, newEntries: safeNew.length, total: merged.length, unscheduled: result.unscheduled.length }, 'Partial replan complete');
 
-  return merged;
+  return { entries: merged, unscheduled: result.unscheduled };
+}
+
+function toPlain(entry: IScheduleEntry): IScheduleEntry {
+  const anyEntry = entry as any;
+  return typeof anyEntry.toObject === 'function' ? anyEntry.toObject() : { ...entry };
 }

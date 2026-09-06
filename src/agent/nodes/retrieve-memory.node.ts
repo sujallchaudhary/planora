@@ -1,47 +1,40 @@
 import type { AgentState } from '../state.js';
-import { HybridRetriever } from '../../memory/hybrid-retriever.js';
-import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { EMPTY_MEMORY } from '../../memory/hybrid-retriever.js';
+import { getRetriever } from '../../scheduler/replan-service.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
+import { todayString } from '../../utils/date.js';
+import { IntentType } from '../../config/defaults.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('node:retrieve-memory');
 
-let retriever: HybridRetriever | null = null;
-
-function getRetriever(): HybridRetriever {
-  if (!retriever) {
-    const llm = getLLMProvider();
-    const semanticMemory = new SemanticMemory((text) => llm.getEmbedding(text));
-    retriever = new HybridRetriever(semanticMemory);
-  }
-  return retriever;
-}
-
 export async function retrieveMemoryNode(state: AgentState): Promise<Partial<AgentState>> {
-  log.debug({ telegramId: state.telegramId }, 'Retrieving memory');
+  if (state.intent?.classificationError) return { retrievedMemory: EMPTY_MEMORY };
 
   const user = await userRepo.findByTelegramId(state.telegramId);
   const config = resolveUserConfig(user?.settings);
 
+  // Vector context only feeds the conversational reply. Routine actions (done/skip/show)
+  // get templated replies, so skip the embedding call for them.
+  const intent = state.intent;
+  const needsSemantic = !!intent && (
+    intent.intent === IntentType.GENERAL_CHAT
+    || intent.intent === IntentType.IMAGE_CONTEXT
+    || intent.intent === IntentType.REMOVE_MEMORY
+    || intent.memorySignals.length > 0
+    || !!intent.userState?.energy
+    || !!intent.userState?.mood
+  ) && !intent.reasoning?.startsWith('fast:');
+
   try {
-    const memory = await getRetriever().retrieve(
-      state.telegramId,
-      state.rawInput,
-      config.memoryConfidenceThreshold,
-    );
+    const memory = await getRetriever().retrieve(state.telegramId, state.rawInput, config.memoryConfidenceThreshold, {
+      asOfDate: todayString(config.timezone),
+      skipSemantic: !needsSemantic,
+    });
     return { retrievedMemory: memory };
   } catch (error) {
     log.error({ error }, 'Failed to retrieve memory, continuing without it');
-    return {
-      retrievedMemory: {
-        preferences: [],
-        habits: [],
-        constraints: [],
-        semanticContext: [],
-        recentHistory: [],
-      },
-    };
+    return { retrievedMemory: EMPTY_MEMORY };
   }
 }

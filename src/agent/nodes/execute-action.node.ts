@@ -1,20 +1,383 @@
 import type { AgentState } from '../state.js';
 import type { ActionResult } from '../../llm/provider.js';
-import { IntentType, TaskStatus } from '../../config/defaults.js';
+import type { IntentPayload, ExtractedTask } from '../../utils/zod-schemas.js';
+import type { IUser } from '../../memory/mongo/models/user.model.js';
+import type { ITask } from '../../memory/mongo/models/task.model.js';
+import { IntentType, PLANNING } from '../../config/defaults.js';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
-import { taskHistoryRepo } from '../../memory/mongo/repositories/task-history.repo.js';
-import { resolveUserConfig } from '../../config/config-resolver.js';
-import { planSchedule } from '../../scheduler/planner.js';
-import { replan } from '../../scheduler/replanner.js';
-import { syncReminders } from '../../execution/job-manager.js';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
-import { planningDateString } from '../../utils/date.js';
-import { createChildLogger } from '../../utils/logger.js';
+import { preferenceRepo } from '../../memory/mongo/repositories/preference.repo.js';
+import { Habit } from '../../memory/mongo/models/habit.model.js';
+import { Constraint } from '../../memory/mongo/models/constraint.model.js';
+import { resolveUserConfig, type UserConfig } from '../../config/config-resolver.js';
+import { replanDates, formatScheduleLines, describeUnscheduled } from '../../scheduler/replan-service.js';
+import { completeTask, skipTaskToday, inferCurrentTask, nextUpcomingEntry } from '../../scheduler/task-actions.js';
+import { taskEligibility } from '../../scheduler/planner.js';
 import type { PlanningContext } from '../../scheduler/planning-context.js';
+import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
+import { getLLMProvider } from '../../llm/index.js';
+import { normalizeDays } from '../../memory/memory-utils.js';
+import { setPendingAction } from '../../bot/pending-action.js';
+import {
+  planningDateString, tomorrowString, isValidDateString, dateStringToDate, formatDateString,
+  daysBetween, parseTimeString, normalizeTimeString, formatDateHuman, formatTimeHuman, formatMinutes, formatTime,
+} from '../../utils/date.js';
+import { createChildLogger } from '../../utils/logger.js';
+import { extractDateHints } from '../../utils/nl-dates.js';
 
 const log = createChildLogger('node:execute');
+
+interface Ctx {
+  state: AgentState;
+  user: IUser;
+  config: UserConfig;
+  tz: string;
+  today: string;
+  tomorrow: string;
+  now: Date;
+  replanDates: Set<string>;
+  planningContext: PlanningContext;
+  messages: string[];
+  data: Record<string, unknown>;
+  success: boolean;
+  action: string;
+  /** Which date's full timeline to hand back (REPLAN / SHOW_PLAN). */
+  timelineDate?: string;
+}
+
+const dueLabel = (ctx: Ctx, task: ITask) => task.dueDate ? ` (due ${formatDateHuman(formatDateString(task.dueDate, ctx.tz))})` : '';
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async function addTasks(ctx: Ctx, tasks: ExtractedTask[], announce = true): Promise<ITask[]> {
+  const created: ITask[] = [];
+  const dupes: string[] = [];
+  // Deterministic date read of the message — only trusted when it is unambiguous (one hint, one task).
+  const hints = extractDateHints(ctx.state.rawInput, ctx.now, ctx.tz);
+  const hint = tasks.length === 1 && hints.length === 1 ? hints[0] : undefined;
+
+  for (let t of tasks) {
+    const title = t.title?.trim();
+    if (!title) continue;
+
+    let fixedStart = normalizeTimeString(t.fixedStartTime);
+    let fixedEnd = normalizeTimeString(t.fixedEndTime);
+    if (hint?.time && !fixedStart && !t.recurrence?.pattern && /\b(at|from|@)\b/i.test(hint.text)) {
+      // The user gave a clock time the model dropped → treat it as a fixed slot.
+      fixedStart = hint.time;
+      fixedEnd = hint.endTime ?? null;
+      if (!fixedEnd) {
+        const mins = Math.max(15, t.estimatedMinutes ?? 30);
+        const endDate = new Date(parseTimeString(fixedStart, ctx.today, ctx.tz).getTime() + mins * 60_000);
+        fixedEnd = formatTime(endDate, ctx.tz);
+      }
+      t = { ...t, isFixed: true };
+    }
+    const isFixed = !!(t.isFixed && fixedStart && fixedEnd && fixedStart < fixedEnd);
+    const recurrence = t.recurrence?.pattern ? { pattern: t.recurrence.pattern, days: normalizeDays(t.recurrence.days) } : undefined;
+
+    let dueStr = isValidDateString(t.dueDate) ? t.dueDate : null;
+    if (hint && !recurrence) {
+      if (!dueStr && hint.date !== ctx.today) dueStr = hint.date;                 // model dropped the date
+      else if (dueStr && dueStr < ctx.today && hint.date >= ctx.today) dueStr = hint.date; // model picked a past date
+    }
+    if (isFixed && !dueStr && !recurrence) {
+      // "meeting at 3" with no date = today, or tomorrow if that time is already gone.
+      dueStr = parseTimeString(fixedEnd!, ctx.today, ctx.tz) <= ctx.now ? ctx.tomorrow : ctx.today;
+    }
+
+    let estimatedMinutes = Math.max(5, t.estimatedMinutes ?? 30);
+    if (isFixed) {
+      const mins = (parseTimeString(fixedEnd!, ctx.today, ctx.tz).getTime() - parseTimeString(fixedStart!, ctx.today, ctx.tz).getTime()) / 60_000;
+      if (mins > 0) estimatedMinutes = mins;
+    }
+
+    const { task, created: isNew } = await taskRepo.createIfNew({
+      userId: ctx.user._id as any,
+      telegramId: ctx.state.telegramId,
+      title,
+      description: t.description ?? undefined,
+      priority: t.priority ?? undefined,
+      cognitiveLoad: t.cognitiveLoad ?? undefined,
+      estimatedMinutes,
+      dueDate: dueStr ? dateStringToDate(dueStr, ctx.tz) : undefined,
+      preferredTime: t.preferredTime ?? undefined,
+      tags: t.tags ?? undefined,
+      isFixed,
+      fixedStartTime: isFixed ? fixedStart! : undefined,
+      fixedEndTime: isFixed ? fixedEnd! : undefined,
+      recurrence,
+    });
+
+    if (isNew) created.push(task); else dupes.push(task.title);
+
+    ctx.replanDates.add(ctx.today);
+    if (dueStr && dueStr > ctx.today && daysBetween(ctx.today, dueStr) <= PLANNING.LOOKAHEAD_DAYS) {
+      ctx.replanDates.add(dueStr);
+    }
+  }
+
+  if (announce) {
+    if (created.length > 0) {
+      ctx.messages.push(`Added: ${created.map(t => `"${t.title}"${dueLabel(ctx, t)}${t.isFixed && t.fixedStartTime ? ` at ${t.fixedStartTime}` : ''}`).join(', ')}.`);
+    }
+    if (dupes.length > 0) ctx.messages.push(`Already on the list: ${dupes.map(d => `"${d}"`).join(', ')}.`);
+    if (created.length === 0 && dupes.length === 0) {
+      ctx.success = false;
+      ctx.messages.push("I couldn't work out what task to add.");
+    }
+  }
+  ctx.data.tasks = created.map(t => ({ id: String(t._id), title: t.title, dueDate: t.dueDate ? formatDateString(t.dueDate, ctx.tz) : null }));
+  return created;
+}
+
+async function askWhichTask(ctx: Ctx, verb: string, ref?: string | null): Promise<void> {
+  const open = await taskRepo.findOpenTasksForDate(ctx.state.telegramId, ctx.today);
+  const candidates = open.slice(0, 8).map(t => t.title);
+  ctx.success = false;
+  ctx.data.candidates = candidates;
+  ctx.messages.push(ref
+    ? `I couldn't find a task matching "${ref}" to ${verb}.${candidates.length ? ` Open tasks: ${candidates.join(', ')}.` : ''}`
+    : `Which task should I ${verb}?${candidates.length ? ` Open tasks: ${candidates.join(', ')}.` : ' You have no open tasks.'}`);
+  if (candidates.length > 0) {
+    await setPendingAction(ctx.state.telegramId, { type: 'clarify_task', candidates }).catch(() => undefined);
+  }
+}
+
+async function modifyTask(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  const task = await taskRepo.resolveTask(ctx.state.telegramId, payload.taskReference);
+  if (!task) return askWhichTask(ctx, 'change', payload.taskReference);
+
+  const t = payload.tasks[0];
+  const updates: Record<string, unknown> = {};
+  let placementChanged = false;
+  let newDueStr: string | null = null;
+
+  if (t) {
+    if (t.title && t.title.trim() && t.title.trim().toLowerCase() !== task.title.toLowerCase()) updates.title = t.title.trim();
+    if (t.description) updates.description = t.description;
+    if (t.priority) updates.priority = t.priority;
+    if (t.cognitiveLoad) updates.cognitiveLoad = t.cognitiveLoad;
+    if (t.estimatedMinutes && t.estimatedMinutes !== task.estimatedMinutes) { updates.estimatedMinutes = Math.max(5, t.estimatedMinutes); placementChanged = true; }
+    if (t.preferredTime) { updates.preferredTime = t.preferredTime; placementChanged = true; }
+    if (t.recurrence?.pattern) updates.recurrence = { pattern: t.recurrence.pattern, days: normalizeDays(t.recurrence.days) };
+
+    const fixedStart = normalizeTimeString(t.fixedStartTime);
+    const fixedEnd = normalizeTimeString(t.fixedEndTime);
+    if (fixedStart && fixedEnd && fixedStart < fixedEnd) {
+      updates.isFixed = true;
+      updates.fixedStartTime = fixedStart;
+      updates.fixedEndTime = fixedEnd;
+      placementChanged = true;
+      if (!isValidDateString(t.dueDate) && !task.dueDate) {
+        newDueStr = parseTimeString(fixedEnd, ctx.today, ctx.tz) <= ctx.now ? ctx.tomorrow : ctx.today;
+      }
+    } else if (t.isFixed === false && task.isFixed) {
+      updates.isFixed = false;
+      placementChanged = true;
+    }
+
+    if (isValidDateString(t.dueDate)) newDueStr = t.dueDate;
+  }
+
+  if (newDueStr) {
+    updates.dueDate = dateStringToDate(newDueStr, ctx.tz);
+    // "Move X to Friday" means do it Friday, not "any time before Friday".
+    updates.deferredUntil = newDueStr > ctx.today ? newDueStr : null;
+    placementChanged = true;
+  }
+
+  if (Object.keys(updates).length === 0) {
+    ctx.success = false;
+    ctx.messages.push(`I found "${task.title}" but couldn't tell what to change.`);
+    return;
+  }
+
+  await taskRepo.updateTask(String(task._id), updates);
+  if (placementChanged) {
+    const removedFrom = await scheduleRepo.removeTaskEntries(ctx.state.telegramId, String(task._id), ctx.today);
+    removedFrom.forEach(d => ctx.replanDates.add(d));
+  }
+  ctx.replanDates.add(ctx.today);
+  if (newDueStr && newDueStr > ctx.today && daysBetween(ctx.today, newDueStr) <= PLANNING.LOOKAHEAD_DAYS) ctx.replanDates.add(newDueStr);
+
+  const what: string[] = [];
+  if (newDueStr) what.push(`moved to ${formatDateHuman(newDueStr)}`);
+  if (updates.fixedStartTime) what.push(`set to ${updates.fixedStartTime}–${updates.fixedEndTime}`);
+  if (updates.estimatedMinutes) what.push(`now ${formatMinutes(updates.estimatedMinutes as number)}`);
+  if (updates.priority) what.push(`priority ${updates.priority}`);
+  if (updates.title) what.push(`renamed to "${updates.title}"`);
+  if (updates.preferredTime) what.push(`preferred ${updates.preferredTime}`);
+  ctx.messages.push(`Updated "${task.title}"${what.length ? ` — ${what.join(', ')}` : ''}.`);
+}
+
+async function deleteTask(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  const task = await taskRepo.resolveTask(ctx.state.telegramId, payload.taskReference);
+  if (!task) return askWhichTask(ctx, 'delete', payload.taskReference);
+  await taskRepo.deleteTask(String(task._id));
+  const removedFrom = await scheduleRepo.removeTaskEntries(ctx.state.telegramId, String(task._id), ctx.today);
+  removedFrom.forEach(d => ctx.replanDates.add(d));
+  ctx.replanDates.add(ctx.today);
+  ctx.messages.push(`Deleted "${task.title}".`);
+}
+
+async function completeTaskHandler(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  const ref = payload.taskReference;
+  let task = await taskRepo.resolveTask(ctx.state.telegramId, ref);
+  if (!task && !ref) task = await inferCurrentTask(ctx.state.telegramId, ctx.today, ctx.tz, ctx.now);
+  if (!task) return askWhichTask(ctx, 'mark as done', ref);
+
+  const result = await completeTask(ctx.user, ctx.config, task, ctx.today, ctx.now);
+  ctx.replanDates.add(ctx.today);
+  let msg = `Marked "${task.title}" done${result.late ? ' (a little after its slot — no problem)' : ''}.`;
+  if (result.next?.dueDate) msg += ` Next one is queued for ${formatDateHuman(formatDateString(result.next.dueDate, ctx.tz))}.`;
+  ctx.messages.push(msg);
+}
+
+async function skipTaskHandler(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  const ref = payload.taskReference;
+  let task = await taskRepo.resolveTask(ctx.state.telegramId, ref);
+  if (!task && !ref) task = await inferCurrentTask(ctx.state.telegramId, ctx.today, ctx.tz, ctx.now);
+  if (!task) return askWhichTask(ctx, 'skip', ref);
+
+  const result = await skipTaskToday(ctx.user, task, ctx.today);
+  ctx.replanDates.add(ctx.today);
+  ctx.messages.push(`Skipped "${task.title}" for today; it's back on the list for ${formatDateHuman(result.deferredUntil)}.`);
+}
+
+async function memoryHandler(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  // The signals themselves were stored by extract-memory. Only one-off events become tasks.
+  const oneOffs = payload.tasks.filter(t => isValidDateString(t.dueDate));
+  if (oneOffs.length > 0) {
+    await addTasks(ctx, oneOffs);
+  } else {
+    ctx.messages.push("Noted — I'll plan around that from now on.");
+  }
+  ctx.replanDates.add(ctx.today);
+}
+
+function tokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2 && !['the', 'and', 'for', 'with', 'that', 'this', 'from', 'are', 'over', 'stop', 'stopped', 'more', 'anymore', 'going', 'doing'].includes(w));
+}
+
+async function removeMemoryHandler(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  const ref = payload.memoryReference ?? payload.taskReference ?? ctx.state.rawInput;
+  const words = tokens(ref);
+  const telegramId = ctx.state.telegramId;
+
+  const [habits, constraints, prefs] = await Promise.all([
+    Habit.find({ telegramId, isActive: true }),
+    Constraint.find({ telegramId, isActive: true }),
+    preferenceRepo.findByTelegramId(telegramId),
+  ]);
+
+  type Cand = { kind: 'habit' | 'constraint' | 'preference'; key: string; label: string; score: number; doc: any };
+  const score = (hay: string) => { const h = hay.toLowerCase(); return words.filter(w => h.includes(w)).length; };
+  const cands: Cand[] = [
+    ...habits.map(h => ({ kind: 'habit' as const, key: h.key, label: `${h.key.replace(/_/g, ' ')} (habit)`, score: score(`${h.key} ${h.description}`), doc: h })),
+    ...constraints.map(c => ({ kind: 'constraint' as const, key: c.key, label: `${c.key.replace(/_/g, ' ')} (commitment)`, score: score(`${c.key} ${c.description}`), doc: c })),
+    ...prefs.map(p => ({ kind: 'preference' as const, key: p.key, label: `${p.key.replace(/_/g, ' ')}: ${p.value} (preference)`, score: score(`${p.key} ${p.value}`), doc: p })),
+  ].sort((a, b) => b.score - a.score);
+
+  const best = cands[0];
+  if (!best || best.score === 0) {
+    ctx.success = false;
+    const known = cands.slice(0, 8).map(c => c.label);
+    ctx.messages.push(`I couldn't tell which of your routines or commitments to drop.${known.length ? ` I currently know: ${known.join('; ')}.` : ''}`);
+    ctx.data.candidates = known;
+    return;
+  }
+
+  if (best.kind === 'habit') await Habit.updateOne({ _id: best.doc._id }, { $set: { isActive: false } });
+  else if (best.kind === 'constraint') await Constraint.updateOne({ _id: best.doc._id }, { $set: { isActive: false } });
+  else await preferenceRepo.remove(telegramId, best.key);
+
+  try {
+    const llm = getLLMProvider();
+    await new SemanticMemory((t) => llm.getEmbedding(t)).deleteByKey(telegramId, best.key);
+  } catch (err) {
+    log.debug({ err }, 'Vector memory delete skipped');
+  }
+
+  ctx.replanDates.add(ctx.today);
+  ctx.messages.push(`Dropped ${best.label}. I won't plan around it anymore.`);
+}
+
+function replanHandler(ctx: Ctx, payload: IntentPayload): void {
+  const date = isValidDateString(payload.targetDate) && payload.targetDate >= ctx.today ? payload.targetDate : ctx.today;
+  ctx.replanDates.add(date);
+  ctx.timelineDate = date;
+  if (payload.replanContext && !ctx.planningContext.reason) ctx.planningContext.reason = payload.replanContext;
+  if (!ctx.planningContext.trigger) ctx.planningContext.trigger = 'explicit_replan';
+  if (!ctx.planningContext.scheduleStability) ctx.planningContext.scheduleStability = 'moderate';
+}
+
+async function showPlanHandler(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  const date = isValidDateString(payload.targetDate) ? payload.targetDate : ctx.today;
+  const schedule = await scheduleRepo.findByDate(ctx.state.telegramId, date);
+  const openTasks = await taskRepo.findOpenTasksForDate(ctx.state.telegramId, date);
+  const label = date === ctx.today ? 'today' : date === ctx.tomorrow ? 'tomorrow' : formatDateHuman(date);
+  const eligible = openTasks.filter(t => taskEligibility(t, date, ctx.tz).eligible);
+
+  ctx.data.targetDate = date;
+  ctx.data.pendingTasks = eligible.map(t => ({ title: t.title, estimatedMinutes: t.estimatedMinutes, dueDate: t.dueDate ? formatDateString(t.dueDate, ctx.tz) : null }));
+
+  if (!schedule || schedule.entries.length === 0) {
+    if (date >= ctx.today && eligible.length > 0) {
+      // A manager wouldn't say "no plan" — they'd make one.
+      ctx.replanDates.add(date);
+      ctx.timelineDate = date;
+      ctx.messages.push(`There was no plan for ${label} yet, so I built one.`);
+    } else {
+      ctx.messages.push(`Nothing planned for ${label}${eligible.length === 0 ? ' and no open tasks for it' : ''}.`);
+      ctx.data.scheduleSummary = 'empty';
+    }
+    return;
+  }
+
+  ctx.timelineDate = date;
+  ctx.data.scheduleText = `📅 *${label === 'today' ? "Today's plan" : `Plan for ${label}`}*\n` + formatScheduleLines(schedule.entries, ctx.tz).join('\n');
+  ctx.data.scheduleSummary = schedule.entries.map(e => `${formatTimeHuman(new Date(e.startTime), ctx.tz)} ${e.title} [${e.status}]`).join('; ');
+  const remaining = schedule.entries.filter(e => e.taskId && (e.status === 'scheduled' || e.status === 'active')).length;
+  ctx.messages.push(`Plan for ${label}: ${schedule.entries.length} blocks, ${remaining} task blocks still to do.`);
+}
+
+async function handle(ctx: Ctx, payload: IntentPayload): Promise<void> {
+  switch (payload.intent) {
+    case IntentType.ADD_TASK: {
+      const fromImage = payload.tasks.length === 0 && ctx.state.imageContext?.tasks?.length
+        ? ctx.state.imageContext.tasks.map(t => ({ ...t, cognitiveLoad: 2 as const, preferredTime: null, tags: [] as string[], recurrence: null }))
+        : [];
+      await addTasks(ctx, [...payload.tasks, ...fromImage]);
+      return;
+    }
+    case IntentType.MODIFY_TASK: return modifyTask(ctx, payload);
+    case IntentType.DELETE_TASK: return deleteTask(ctx, payload);
+    case IntentType.COMPLETE_TASK: return completeTaskHandler(ctx, payload);
+    case IntentType.SKIP_TASK: return skipTaskHandler(ctx, payload);
+    case IntentType.ADD_PREFERENCE:
+    case IntentType.ADD_CONSTRAINT:
+    case IntentType.ADD_HABIT: return memoryHandler(ctx, payload);
+    case IntentType.REMOVE_MEMORY: return removeMemoryHandler(ctx, payload);
+    case IntentType.REPLAN: return replanHandler(ctx, payload);
+    case IntentType.SHOW_PLAN: return showPlanHandler(ctx, payload);
+    case IntentType.IMAGE_CONTEXT: {
+      const imgTasks = ctx.state.imageContext?.tasks ?? [];
+      if (payload.tasks.length > 0 || imgTasks.length > 0) {
+        await addTasks(ctx, payload.tasks.length > 0 ? payload.tasks : imgTasks.map(t => ({ ...t, cognitiveLoad: 2 as const, preferredTime: null, tags: [] as string[], recurrence: null })));
+      } else {
+        ctx.messages.push(ctx.state.imageContext ? `I read the image but found no tasks in it: ${ctx.state.imageContext.content.slice(0, 200)}` : 'No image found.');
+      }
+      ctx.data.imageContent = ctx.state.imageContext?.content;
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+// ─── Node ─────────────────────────────────────────────────────────────────────
 
 export async function executeActionNode(state: AgentState): Promise<Partial<AgentState>> {
   if (!state.intent) {
@@ -27,562 +390,94 @@ export async function executeActionNode(state: AgentState): Promise<Partial<Agen
   }
 
   const config = resolveUserConfig(user.settings);
-  // Use late-night-aware planning date — before 4 AM, "today" = yesterday
-  const today = planningDateString(config.timezone, config.lateNightThresholdHour);
+  const ctx: Ctx = {
+    state,
+    user,
+    config,
+    tz: config.timezone,
+    today: planningDateString(config.timezone, config.lateNightThresholdHour),
+    tomorrow: tomorrowString(config.timezone, config.lateNightThresholdHour),
+    now: new Date(),
+    replanDates: new Set<string>(),
+    planningContext: { ...(state.autonomyContext?.planningContext ?? {}) },
+    messages: [],
+    data: {},
+    success: true,
+    action: state.intent.intent.toLowerCase(),
+  };
 
-  let result: ActionResult;
-  let replanAlreadyDone = false;
-  const effectiveIntent = state.autonomyContext?.shouldReplan && state.intent.intent === IntentType.GENERAL_CHAT
+  const primaryIntent = state.intent.intent === IntentType.GENERAL_CHAT && state.autonomyContext?.shouldReplan
     ? IntentType.REPLAN
     : state.intent.intent;
 
-  switch (effectiveIntent) {
-    case IntentType.ADD_TASK: {
-      const tasks = state.intent.tasks;
-      // Also include tasks extracted from images
-      if (state.imageContext?.tasks) {
-        tasks.push(...state.imageContext.tasks.map(t => ({
-          ...t,
-          cognitiveLoad: 2 as const,
-          preferredTime: undefined,
-          tags: [] as string[],
-        })));
-      }
+  const primary: IntentPayload = {
+    intent: primaryIntent,
+    tasks: state.intent.tasks,
+    taskReference: state.intent.taskReference,
+    memoryReference: state.intent.memoryReference,
+    replanContext: state.intent.replanContext ?? state.autonomyContext?.summary,
+    targetDate: state.intent.targetDate,
+  };
 
-      if (tasks.length === 0) {
-        result = { success: false, action: 'add_task', message: 'I couldn\'t extract any tasks from your message.' };
-        break;
-      }
-
-      const created = [];
-      for (const task of tasks) {
-        const newTask = await taskRepo.create({
-          userId: user._id,
-          telegramId: state.telegramId,
-          title: task.title,
-          description: task.description ?? undefined,
-          priority: task.priority ?? undefined,
-          cognitiveLoad: task.cognitiveLoad ?? undefined,
-          estimatedMinutes: task.estimatedMinutes ?? undefined,
-          dueDate: task.dueDate ? new Date(task.dueDate) : undefined,
-          preferredTime: task.preferredTime ?? undefined,
-          tags: task.tags ?? undefined,
-          isFixed: task.isFixed ?? undefined,
-          fixedStartTime: task.fixedStartTime ?? undefined,
-          fixedEndTime: task.fixedEndTime ?? undefined,
-        });
-        created.push(newTask);
-      }
-
-      result = {
-        success: true,
-        action: 'add_task',
-        message: `Added ${created.length} task(s)`,
-        data: { tasks: created.map(t => ({ id: t._id, title: t.title, priority: t.priority })) },
-      };
-      // Smart replan: target the earliest due date among added tasks, falling back to today
-      const dueDates = tasks.map(t => t.dueDate).filter(Boolean) as string[];
-      const earliestDue = dueDates.length > 0
-        ? dueDates.sort()[0]!
-        : today;
-      const replanTarget = earliestDue < today ? today : earliestDue;
-
-      // Always replan today to fit the new tasks, and if the early due date is different, replan that too
-      const datesToReplan = Array.from(new Set([today, replanTarget]));
-      for (const targetDate of datesToReplan) {
-        await triggerReplan(state.telegramId, user._id.toString(), config, targetDate, state.autonomyContext?.planningContext);
-      }
-      
-      replanAlreadyDone = true;
-      result.message += ' and updated your schedule.';
-      break;
-    }
-
-    case IntentType.MODIFY_TASK: {
-      const ref = state.intent.taskReference;
-      if (!ref) {
-        result = { success: false, action: 'modify_task', message: 'Which task do you want to modify?' };
-        break;
-      }
-      const task = await taskRepo.findById(ref) ?? (await taskRepo.findByTitle(state.telegramId, ref))[0];
-      if (!task) {
-        result = { success: false, action: 'modify_task', message: `I couldn't find that task.` };
-        break;
-      }
-      const updates: Record<string, unknown> = {};
-      if (state.intent.tasks[0]) {
-        const t = state.intent.tasks[0];
-        if (t.title) updates.title = t.title;
-        if (t.description) updates.description = t.description;
-        if (t.priority) updates.priority = t.priority;
-        if (t.estimatedMinutes) updates.estimatedMinutes = t.estimatedMinutes;
-        if (t.preferredTime) updates.preferredTime = t.preferredTime;
-        if (t.dueDate !== undefined) updates.dueDate = t.dueDate ? new Date(t.dueDate) : null;
-        if (t.isFixed !== undefined) updates.isFixed = t.isFixed;
-        if (t.fixedStartTime !== undefined) updates.fixedStartTime = t.fixedStartTime;
-        if (t.fixedEndTime !== undefined) updates.fixedEndTime = t.fixedEndTime;
-      }
-      await taskRepo.updateTask(task._id!.toString(), updates);
-      
-      // Determine which day to replan (the new due date if changed, otherwise today)
-      let replanTarget = today;
-      if (updates.dueDate) {
-        replanTarget = (updates.dueDate as Date).toISOString().split('T')[0]!;
-      } else if (task.dueDate) {
-        replanTarget = task.dueDate.toISOString().split('T')[0]!;
-      }
-      
-      result = { success: true, action: 'modify_task', message: `Updated task "${task.title}"` };
-      await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget, state.autonomyContext?.planningContext);
-      replanAlreadyDone = true;
-      result.message += ' and updated your schedule.';
-      break;
-    }
-
-    case IntentType.DELETE_TASK: {
-      const ref = state.intent.taskReference;
-      if (!ref) {
-        result = { success: false, action: 'delete_task', message: 'Which task do you want to delete?' };
-        break;
-      }
-      const taskToDelete = await taskRepo.findById(ref) ?? (await taskRepo.findByTitle(state.telegramId, ref))[0];
-      if (!taskToDelete) {
-        result = { success: false, action: 'delete_task', message: `I couldn't find that task.` };
-        break;
-      }
-      await taskRepo.deleteTask(taskToDelete._id!.toString());
-      result = { success: true, action: 'delete_task', message: `Deleted task "${taskToDelete.title}"` };
-      await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
-      replanAlreadyDone = true;
-      result.message += ' and updated your schedule.';
-      break;
-    }
-
-    case IntentType.COMPLETE_TASK: {
-      const ref = state.intent.taskReference;
-
-      const todaySchedule = await scheduleRepo.findByDate(state.telegramId, today);
-      let countComplete = 0;
-      let taskTitle = ref ?? 'task';
-
-      // No specific task referenced → complete everything
-      if (!ref) {
-        if (todaySchedule) {
-          for (const e of todaySchedule.entries) {
-            if (e.status === 'scheduled' || e.status === 'active') {
-              await scheduleRepo.updateEntryStatus(state.telegramId, today, (e as any)._id.toString(), 'completed');
-              if (e.taskId) {
-                await taskRepo.updateStatus(e.taskId.toString(), TaskStatus.COMPLETED);
-              }
-              countComplete++;
-            }
-          }
-        }
-        const pending = await taskRepo.findPendingTasks(state.telegramId);
-        for (const pt of pending) {
-          await taskRepo.updateStatus(pt._id!.toString(), TaskStatus.COMPLETED);
-          countComplete++;
-        }
-        result = { success: true, action: 'complete_task', message: `Marked ${countComplete} tasks as completed ✅` };
-        replanAlreadyDone = true;
-        await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
-        result.message += ' and updated your schedule.';
-        break;
-      }
-
-      let found = false;
-
-      // Look up by task _id first (from LLM), then check schedule
-      const taskById = await taskRepo.findById(ref);
-      if (taskById) {
-        await taskRepo.updateStatus(taskById._id!.toString(), TaskStatus.COMPLETED);
-        taskTitle = taskById.title;
-        found = true;
-
-        // Also update the schedule entry if it exists
-        if (todaySchedule) {
-          const scheduleEntry = todaySchedule.entries.find(e => e.taskId?.toString() === taskById._id!.toString());
-          if (scheduleEntry) {
-            await scheduleRepo.updateEntryStatus(state.telegramId, today, (scheduleEntry as any)._id.toString(), 'completed');
-            await taskHistoryRepo.record({
-              userId: user._id,
-              telegramId: state.telegramId,
-              taskId: taskById._id!,
-              title: taskById.title,
-              scheduledDate: today,
-              scheduledStartTime: scheduleEntry.startTime,
-              scheduledEndTime: scheduleEntry.endTime,
-              outcome: 'completed',
-              completedAt: new Date(),
-            });
-          }
-        }
-      }
-
-      result = {
-        success: true,
-        action: 'complete_task',
-        message: found ? `Marked "${taskTitle}" as completed ✅` : 'I couldn\'t find that task in your schedule. Try /schedule to see your tasks.',
-      };
-      if (found) {
-        await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
-        replanAlreadyDone = true;
-        result.message += ' and updated your schedule.';
-      }
-      break;
-    }
-
-    case IntentType.SKIP_TASK: {
-      const ref = state.intent.taskReference;
-      const todaySchedule = await scheduleRepo.findByDate(state.telegramId, today);
-      let taskTitle = ref ?? 'current task';
-      let skipped = false;
-
-      // Look up by task _id first
-      if (ref) {
-        const taskById = await taskRepo.findById(ref);
-        if (taskById) {
-          await taskRepo.updateStatus(taskById._id!.toString(), TaskStatus.SKIPPED);
-          taskTitle = taskById.title;
-          skipped = true;
-
-          if (todaySchedule) {
-            const scheduleEntry = todaySchedule.entries.find(e => e.taskId?.toString() === taskById._id!.toString());
-            if (scheduleEntry) {
-              await scheduleRepo.updateEntryStatus(state.telegramId, today, (scheduleEntry as any)._id.toString(), 'skipped');
-              await taskHistoryRepo.record({
-                userId: user._id,
-                telegramId: state.telegramId,
-                taskId: taskById._id!,
-                title: taskById.title,
-                scheduledDate: today,
-                scheduledStartTime: scheduleEntry.startTime,
-                scheduledEndTime: scheduleEntry.endTime,
-                outcome: 'skipped',
-              });
-            }
-          }
-        }
-      }
-
-      // Fallback: skip first active/scheduled entry if no ref
-      if (!skipped && todaySchedule) {
-        const activeEntry = todaySchedule.entries.find(e =>
-          e.status === 'scheduled' || e.status === 'active'
-        );
-        if (activeEntry) {
-          await scheduleRepo.updateEntryStatus(state.telegramId, today, (activeEntry as any)._id.toString(), 'skipped');
-          taskTitle = activeEntry.title;
-          if (activeEntry.taskId) {
-            await taskRepo.updateStatus(activeEntry.taskId.toString(), TaskStatus.SKIPPED);
-            await taskHistoryRepo.record({
-              userId: user._id,
-              telegramId: state.telegramId,
-              taskId: activeEntry.taskId,
-              title: activeEntry.title,
-              scheduledDate: today,
-              scheduledStartTime: activeEntry.startTime,
-              scheduledEndTime: activeEntry.endTime,
-              outcome: 'skipped',
-            });
-          }
-        }
-      }
-
-      // Trigger partial replan
-      await triggerReplan(state.telegramId, user._id.toString(), config, today, state.autonomyContext?.planningContext);
-      replanAlreadyDone = true;
-      result = { success: true, action: 'skip_task', message: `Skipped "${taskTitle}" and replanned the rest of your day` };
-      break;
-    }
-
-    case IntentType.ADD_PREFERENCE:
-    case IntentType.ADD_CONSTRAINT:
-    case IntentType.ADD_HABIT: {
-      // Memory signals are already stored in the extract-memory node
-      // BUT if the LLM also extracted tasks (e.g. "exam from 2-5 PM"), we must create them!
-      const memTasks = state.intent.tasks;
-      if (memTasks.length > 0) {
-        const created = [];
-        for (const task of memTasks) {
-          const newTask = await taskRepo.create({
-            userId: user._id,
-            telegramId: state.telegramId,
-            title: task.title,
-            description: task.description ?? undefined,
-            priority: task.priority ?? undefined,
-            cognitiveLoad: task.cognitiveLoad ?? undefined,
-            estimatedMinutes: task.estimatedMinutes ?? undefined,
-            dueDate: task.dueDate ? new Date(task.dueDate) : undefined,
-            preferredTime: task.preferredTime ?? undefined,
-            tags: task.tags ?? undefined,
-            isFixed: task.isFixed ?? undefined,
-            fixedStartTime: task.fixedStartTime ?? undefined,
-            fixedEndTime: task.fixedEndTime ?? undefined,
-          });
-          created.push(newTask);
-        }
-        // Smart replan: target the task's due date
-        const dueDates = memTasks.map(t => t.dueDate).filter(Boolean) as string[];
-        const replanTarget = dueDates.length > 0
-          ? (dueDates.sort()[0]! < today ? today : dueDates.sort()[0]!)
-          : today;
-        await triggerReplan(state.telegramId, user._id.toString(), config, replanTarget, state.autonomyContext?.planningContext);
-        replanAlreadyDone = true;
-        result = {
-          success: true,
-          action: 'add_memory',
-          message: `Got it! Added ${created.length} task(s) and updated your schedule.`,
-          data: { tasks: created.map(t => ({ id: t._id, title: t.title })) },
-        };
-      } else {
-        result = { success: true, action: 'add_memory', message: 'Got it! I\'ll remember that for future planning.' };
-      }
-      break;
-    }
-
-    case IntentType.REPLAN: {
-      const replanDate = state.intent.targetDate ?? today;
-      const newEntries = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate, state.autonomyContext?.planningContext);
-      const dateLabel = replanDate === today ? 'your day' : replanDate;
-      result = {
-        success: true,
-        action: 'replan',
-        message: `Replanned ${dateLabel} — ${newEntries} tasks scheduled`,
-        data: { scheduledCount: newEntries, reason: state.intent.replanContext ?? state.autonomyContext?.summary, targetDate: replanDate },
-      };
-      break;
-    }
-
-    case IntentType.SHOW_PLAN: {
-      const showDate = state.intent.targetDate ?? today;
-      const schedule = await scheduleRepo.findByDate(state.telegramId, showDate);
-      const pendingTasks = await taskRepo.findPendingTasks(state.telegramId);
-      const dateLabel = showDate === today ? 'today' : showDate;
-
-      if (!schedule || schedule.entries.length === 0) {
-        if (pendingTasks.length > 0) {
-          result = {
-            success: true,
-            action: 'show_plan',
-            message: `No schedule for ${dateLabel} yet, but you have ${pendingTasks.length} pending task(s). Say "plan my day" to schedule them.`,
-            data: {
-              entries: [],
-              targetDate: showDate,
-              pendingTasks: pendingTasks.map(t => ({ id: t._id, title: t.title, priority: t.priority, estimatedMinutes: t.estimatedMinutes })),
-            },
-          };
-        } else {
-          result = { success: true, action: 'show_plan', message: `No schedule or pending tasks for ${dateLabel}.`, data: { entries: [], targetDate: showDate, pendingTasks: [] } };
-        }
-      } else {
-        result = {
-          success: true,
-          action: 'show_plan',
-          message: `Here's your plan for ${dateLabel}`,
-          data: {
-            targetDate: showDate,
-            entries: schedule.entries.map(e => ({
-              title: e.title,
-              startTime: e.startTime,
-              endTime: e.endTime,
-              status: e.status,
-              priority: e.priority,
-            })),
-            pendingTasks: pendingTasks.map(t => ({ id: t._id, title: t.title, priority: t.priority, estimatedMinutes: t.estimatedMinutes })),
-          },
-        };
-      }
-      break;
-    }
-
-    case IntentType.IMAGE_CONTEXT: {
-      if (state.imageContext) {
-        const tasks = state.imageContext.tasks;
-        if (tasks.length > 0) {
-          const created = [];
-          for (const task of tasks) {
-            const newTask = await taskRepo.create({
-              userId: user._id,
-              telegramId: state.telegramId,
-              title: task.title,
-              description: task.description ?? undefined,
-              priority: task.priority ?? undefined,
-              estimatedMinutes: task.estimatedMinutes ?? undefined,
-              dueDate: task.dueDate ? new Date(task.dueDate) : undefined,
-              isFixed: task.isFixed ?? undefined,
-              fixedStartTime: task.fixedStartTime ?? undefined,
-              fixedEndTime: task.fixedEndTime ?? undefined,
-            });
-            created.push(newTask);
-          }
-          result = {
-            success: true,
-            action: 'image_context',
-            message: `Extracted ${created.length} task(s) from your image`,
-            data: {
-              imageContent: state.imageContext.content,
-              tasks: created.map(t => ({ title: t.title })),
-            },
-          };
-        } else {
-          result = {
-            success: true,
-            action: 'image_context',
-            message: 'I analyzed your image but didn\'t find specific tasks.',
-            data: { imageContent: state.imageContext.content },
-          };
-        }
-      } else {
-        result = { success: false, action: 'image_context', message: 'No image provided.' };
-      }
-      break;
-    }
-
-    default:
-      result = { success: true, action: 'general_chat', message: 'Chat response' };
-  }
-
-  // Process secondary intents (compound messages like "add gym and delete math")
-  if (state.intent.secondaryIntents && state.intent.secondaryIntents.length > 0) {
-    const secondaryResults: string[] = [];
-    for (const secondary of state.intent.secondaryIntents) {
-      try {
-        let msg = '';
-        switch (secondary.intent) {
-          case IntentType.ADD_TASK: {
-            if (secondary.tasks.length > 0) {
-              for (const task of secondary.tasks) {
-                await taskRepo.create({
-                  userId: user._id,
-                  telegramId: state.telegramId,
-                  title: task.title,
-                  description: task.description ?? undefined,
-                  priority: task.priority ?? undefined,
-                  cognitiveLoad: task.cognitiveLoad ?? undefined,
-                  estimatedMinutes: task.estimatedMinutes ?? undefined,
-                  dueDate: task.dueDate ? new Date(task.dueDate) : undefined,
-                  preferredTime: task.preferredTime ?? undefined,
-                  tags: task.tags ?? undefined,
-                  isFixed: task.isFixed ?? undefined,
-                  fixedStartTime: task.fixedStartTime ?? undefined,
-                  fixedEndTime: task.fixedEndTime ?? undefined,
-                });
-              }
-              msg = `Added ${secondary.tasks.length} task(s): ${secondary.tasks.map(t => t.title).join(', ')}`;
-            }
-            break;
-          }
-          case IntentType.DELETE_TASK: {
-            if (secondary.taskReference) {
-              const delTask = await taskRepo.findById(secondary.taskReference) ?? (await taskRepo.findByTitle(state.telegramId, secondary.taskReference))[0];
-              if (delTask) {
-                await taskRepo.deleteTask(delTask._id!.toString());
-                msg = `Deleted "${delTask.title}"`;
-              }
-            }
-            break;
-          }
-          case IntentType.MODIFY_TASK: {
-            if (secondary.taskReference) {
-              const modTask = await taskRepo.findById(secondary.taskReference) ?? (await taskRepo.findByTitle(state.telegramId, secondary.taskReference))[0];
-              if (modTask && secondary.tasks[0]) {
-                const t = secondary.tasks[0];
-                const updates: Record<string, unknown> = {};
-                if (t.title) updates.title = t.title;
-                if (t.description) updates.description = t.description;
-                if (t.priority) updates.priority = t.priority;
-                if (t.estimatedMinutes) updates.estimatedMinutes = t.estimatedMinutes;
-                if (t.preferredTime) updates.preferredTime = t.preferredTime;
-                await taskRepo.updateTask(modTask._id!.toString(), updates);
-                msg = `Updated "${modTask.title}"`;
-              }
-            }
-            break;
-          }
-          case IntentType.COMPLETE_TASK: {
-            if (secondary.taskReference) {
-              const compTask = await taskRepo.findById(secondary.taskReference) ?? (await taskRepo.findByTitle(state.telegramId, secondary.taskReference))[0];
-              if (compTask) {
-                await taskRepo.updateStatus(compTask._id!.toString(), TaskStatus.COMPLETED);
-                msg = `Completed "${compTask.title}"`;
-              }
-            }
-            break;
-          }
-          case IntentType.REPLAN: {
-            if (replanAlreadyDone) {
-              msg = 'Schedule already updated';
-            } else {
-              const replanDate = secondary.targetDate ?? today;
-              const count = await triggerReplan(state.telegramId, user._id.toString(), config, replanDate, state.autonomyContext?.planningContext);
-              replanAlreadyDone = true;
-              msg = `Replanned — ${count} tasks scheduled`;
-            }
-            break;
-          }
-          default:
-            break;
-        }
-        if (msg) {
-          secondaryResults.push(msg);
-          log.info({ secondaryIntent: secondary.intent, msg }, 'Executed secondary intent');
-        }
-      } catch (err) {
-        log.error({ err, secondaryIntent: secondary.intent }, 'Secondary intent failed');
-      }
-    }
-
-    if (secondaryResults.length > 0) {
-      result.message += ' | ' + secondaryResults.join(' | ');
-    }
-  }
-
-  return { actionResult: result };
-}
-
-async function triggerReplan(
-  telegramId: number,
-  userId: string,
-  config: any,
-  today: string,
-  planningContext?: PlanningContext,
-): Promise<number> {
   try {
-    const tasks = await taskRepo.findPendingTasks(telegramId);
-    const existingSchedule = await scheduleRepo.findByDate(telegramId, today);
-    const userDoc = await userRepo.findByTelegramId(telegramId);
-    if (!userDoc) return 0;
-
-    // Fetch real memory so replan respects habits and constraints
-    const llm = getLLMProvider();
-    const { SemanticMemory } = await import('../../memory/qdrant/semantic-memory.js');
-    const { HybridRetriever } = await import('../../memory/hybrid-retriever.js');
-    const semanticMemory = new SemanticMemory((t: string) => llm.getEmbedding(t));
-    const retriever = new HybridRetriever(semanticMemory);
-    const memory = await retriever.retrieve(telegramId, `Replan for ${today}`, config.memoryConfidenceThreshold ?? 0.6).catch(() => ({
-      preferences: [],
-      habits: [],
-      constraints: [],
-      semanticContext: [],
-      recentHistory: [],
-    }));
-
-    const newEntries = await replan(
-      tasks,
-      existingSchedule?.entries ?? [],
-      memory,
-      config,
-      today,
-      planningContext,
-    );
-
-    const schedule = await scheduleRepo.createOrReplace(telegramId, userDoc._id, today, newEntries);
-    await syncReminders(telegramId, today, schedule.entries);
-    log.info({ telegramId, entries: newEntries.length }, 'Replanned schedule');
-    return newEntries.length;
+    await handle(ctx, primary);
   } catch (error) {
-    log.error({ error }, 'Failed to replan');
-    return 0;
+    log.error({ error, intent: primary.intent }, 'Primary intent failed');
+    ctx.success = false;
+    ctx.messages.push('Something went wrong while doing that.');
   }
+
+  for (const secondary of state.intent.secondaryIntents) {
+    try {
+      await handle(ctx, secondary);
+    } catch (error) {
+      log.error({ error, intent: secondary.intent }, 'Secondary intent failed');
+    }
+  }
+
+  if (state.memoryChanged && primaryIntent === IntentType.GENERAL_CHAT) {
+    ctx.replanDates.add(ctx.today);
+    if (ctx.messages.length === 0) ctx.messages.push('Noted that routine — I folded it into today.');
+  }
+
+  // ─── Replans (one per affected date, serialized per user) ───────────────────
+  if (ctx.replanDates.size > 0) {
+    const outcomes = await replanDates(state.telegramId, ctx.replanDates, ctx.planningContext);
+    const focusDate = ctx.timelineDate ?? ctx.today;
+    const focus = outcomes.find(o => o.date === focusDate) ?? outcomes.find(o => o.date === ctx.today);
+
+    if (focus) {
+      const label = focus.date === ctx.today ? 'today' : focus.date === ctx.tomorrow ? 'tomorrow' : formatDateHuman(focus.date);
+      const upcoming = focus.entries.filter(e => e.status === 'scheduled' && new Date(e.endTime) > ctx.now);
+      ctx.data.scheduledCount = focus.scheduledTaskCount;
+      ctx.data.targetDate = focus.date;
+
+      if (ctx.timelineDate) {
+        ctx.data.scheduleText = `📅 *${label === 'today' ? "Today's plan" : `Plan for ${label}`}*\n` + formatScheduleLines(focus.entries, ctx.tz).join('\n');
+        ctx.data.scheduleSummary = upcoming.map(e => `${formatTimeHuman(new Date(e.startTime), ctx.tz)} ${e.title}`).join('; ') || 'nothing left to schedule';
+        ctx.messages.push(`Planned ${label}: ${focus.scheduledTaskCount} task block${focus.scheduledTaskCount === 1 ? '' : 's'}.`);
+      } else if (focus.date === ctx.today) {
+        const next = upcoming[0];
+        if (next) ctx.data.nextUp = `${next.title} at ${formatTimeHuman(new Date(next.startTime), ctx.tz)}`;
+        ctx.messages.push(`Today now has ${focus.scheduledTaskCount} task block${focus.scheduledTaskCount === 1 ? '' : 's'} left${next ? `; next up is ${next.title} at ${formatTimeHuman(new Date(next.startTime), ctx.tz)}` : ''}.`);
+      }
+
+      const leftovers = describeUnscheduled(focus.unscheduled, { escape: false });
+      if (leftovers) {
+        ctx.data.unscheduledSummary = leftovers;
+        ctx.messages.push(leftovers);
+      }
+    }
+  } else if (ctx.success && !ctx.timelineDate && primaryIntent !== IntentType.SHOW_PLAN) {
+    const next = await nextUpcomingEntry(state.telegramId, ctx.today, ctx.now);
+    if (next) ctx.data.nextUp = `${next.title} at ${formatTimeHuman(new Date(next.startTime), ctx.tz)}`;
+  }
+
+  const result: ActionResult = {
+    success: ctx.success,
+    action: ctx.action,
+    message: ctx.messages.join(' ') || (primaryIntent === IntentType.GENERAL_CHAT ? 'Just chatting.' : 'Done.'),
+    data: ctx.data,
+  };
+  return { actionResult: result };
 }

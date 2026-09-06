@@ -7,6 +7,7 @@ import { analyzeContextNode } from './nodes/analyze-context.node.js';
 import { executeActionNode } from './nodes/execute-action.node.js';
 import { generateResponseNode } from './nodes/generate-response.node.js';
 import { IntentType } from '../config/defaults.js';
+import type { ClassificationResult } from '../utils/zod-schemas.js';
 import { createChildLogger } from '../utils/logger.js';
 
 const log = createChildLogger('agent-graph');
@@ -14,13 +15,11 @@ const log = createChildLogger('agent-graph');
 function routeByIntent(state: AgentState): string {
   const intent = state.intent?.intent;
 
-  if (state.autonomyContext?.shouldReplan) {
-    return 'execute-action';
-  }
+  // The LLM call itself failed — do not execute anything on a guessed intent.
+  if (state.intent?.classificationError) return 'generate-response';
 
-  if (intent === IntentType.GENERAL_CHAT) {
-    return 'generate-response';
-  }
+  if (state.autonomyContext?.shouldReplan || state.memoryChanged) return 'execute-action';
+  if (intent === IntentType.GENERAL_CHAT && (state.intent?.secondaryIntents.length ?? 0) === 0) return 'generate-response';
 
   return 'execute-action';
 }
@@ -34,22 +33,15 @@ function buildGraph() {
     .addNode('execute-action', executeActionNode)
     .addNode('generate-response', generateResponseNode)
 
-    // Flow: START → classify → extract-memory → retrieve-memory → (route) → ...
     .addEdge(START, 'classify-intent')
     .addEdge('classify-intent', 'extract-memory')
     .addEdge('extract-memory', 'retrieve-memory')
     .addEdge('retrieve-memory', 'analyze-context')
-
-    // Conditional routing after memory retrieval
     .addConditionalEdges('analyze-context', routeByIntent, {
       'execute-action': 'execute-action',
       'generate-response': 'generate-response',
     })
-
-    // After execution, generate response
     .addEdge('execute-action', 'generate-response')
-
-    // Response is the final node
     .addEdge('generate-response', END);
 
   return graph.compile();
@@ -72,7 +64,7 @@ export async function runAgent(input: {
   rawInput: string;
   imageBase64?: string;
   imageMimeType?: string;
-}): Promise<string> {
+}): Promise<AgentRunResult> {
   const graph = getAgentGraph();
 
   const result = await graph.invoke({
@@ -84,5 +76,25 @@ export async function runAgent(input: {
     imageMimeType: input.imageMimeType,
   });
 
-  return result.response || 'I processed your message but couldn\'t generate a response.';
+  return {
+    response: result.response || 'I processed your message but couldn\'t put a reply together. Try again?',
+    intent: result.intent,
+    memorable: isMemorable(result.intent),
+  };
+}
+
+export interface AgentRunResult {
+  response: string;
+  intent: ClassificationResult | null;
+  /** Whether this turn carries context worth embedding into long-term memory. */
+  memorable: boolean;
+}
+
+const ROUTINE_INTENTS = new Set<string>([IntentType.SHOW_PLAN, IntentType.COMPLETE_TASK, IntentType.SKIP_TASK, IntentType.DELETE_TASK]);
+
+function isMemorable(intent: ClassificationResult | null): boolean {
+  if (!intent || intent.classificationError) return false;
+  if (intent.reasoning?.startsWith('fast:')) return false;
+  if (intent.memorySignals.length > 0 || intent.userState?.energy || intent.userState?.mood) return true;
+  return !ROUTINE_INTENTS.has(intent.intent);
 }

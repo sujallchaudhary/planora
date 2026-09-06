@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import multipart from '@fastify/multipart';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
+import { getLLMProvider } from '../../llm/index.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('route:image');

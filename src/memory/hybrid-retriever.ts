@@ -19,23 +19,59 @@ export interface RetrievedMemory {
   recentHistory: ITaskHistory[];
 }
 
+export const EMPTY_MEMORY: RetrievedMemory = {
+  preferences: [],
+  habits: [],
+  constraints: [],
+  semanticContext: [],
+  recentHistory: [],
+};
+
+export interface RetrieveOptions {
+  /** yyyy-MM-dd used to drop expired constraints. */
+  asOfDate?: string;
+  /** Skip the vector search (planning paths don't need chat context). */
+  skipSemantic?: boolean;
+}
+
 export class HybridRetriever {
   constructor(private semanticMemory: SemanticMemory) {}
 
-  async retrieve(telegramId: number, context: string, confidenceThreshold: number): Promise<RetrievedMemory> {
+  async retrieve(telegramId: number, context: string, confidenceThreshold: number, options: RetrieveOptions = {}): Promise<RetrievedMemory> {
     log.debug({ telegramId }, 'Retrieving hybrid memory');
 
-    // Run all retrieval in parallel for speed
-    const [preferences, habits, constraints, semanticContext, recentHistory] = await Promise.all([
+    const semanticPromise = options.skipSemantic
+      ? Promise.resolve([] as SemanticMatch[])
+      : this.semanticMemory.embed(context)
+          // One embedding, two filtered searches: real memory first, then a little chat context
+          .then(vector => Promise.all([
+            this.semanticMemory.searchByVector(telegramId, vector, 5, { excludeTypes: ['conversation'] }),
+            this.semanticMemory.searchByVector(telegramId, vector, 2, { types: ['conversation'] }),
+          ]))
+          .then(([memory, conversation]) => [...memory, ...conversation])
+          .catch((err) => {
+            log.warn({ err: err?.message ?? err }, 'Semantic search failed, continuing without it');
+            return [] as SemanticMatch[];
+          });
+
+    const [preferences, habits, rawConstraints, semanticContext, recentHistory] = await Promise.all([
       preferenceRepo.findHighConfidence(telegramId, confidenceThreshold),
-      Habit.find({ telegramId, isActive: true, confidence: { $gte: confidenceThreshold } }),
+      Habit.find({ telegramId, isActive: true, confidence: { $gte: Math.min(confidenceThreshold, 0.6) } }),
       Constraint.find({ telegramId, isActive: true }),
-      this.semanticMemory.search(telegramId, context, 5).catch((err) => {
-        log.warn({ err }, 'Semantic search failed, continuing without it');
-        return [] as SemanticMatch[];
-      }),
+      semanticPromise,
       taskHistoryRepo.findRecentHistory(telegramId, 7),
     ]);
+
+    // Expire temporary constraints ("exams until the 20th") lazily.
+    const constraints: IConstraint[] = [];
+    for (const c of rawConstraints) {
+      if (options.asOfDate && c.expiresOn && c.expiresOn < options.asOfDate) {
+        await Constraint.updateOne({ _id: c._id }, { $set: { isActive: false } }).catch(() => undefined);
+        log.info({ telegramId, key: c.key }, 'Constraint expired');
+        continue;
+      }
+      constraints.push(c);
+    }
 
     log.debug({
       preferences: preferences.length,

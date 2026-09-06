@@ -2,7 +2,8 @@ import mongoose, { Schema, Document } from 'mongoose';
 import { ScheduleEntryStatus } from '../../../config/defaults.js';
 
 export interface IScheduleEntry {
-  taskId: mongoose.Types.ObjectId;
+  _id?: mongoose.Types.ObjectId;
+  taskId?: mongoose.Types.ObjectId;
   title: string;
   description: string;
   startTime: Date;
@@ -11,6 +12,8 @@ export interface IScheduleEntry {
   priority: number;
   isFixed: boolean;
   flexibility: number;
+  /** Where the entry came from: task, constraint, habit, recovery, break */
+  kind?: string;
 }
 
 export interface ISchedule extends Document {
@@ -35,6 +38,7 @@ const scheduleEntrySchema = new Schema<IScheduleEntry>(
     priority: { type: Number, default: 2 },
     isFixed: { type: Boolean, default: false },
     flexibility: { type: Number, default: 0.5, min: 0, max: 1 },
+    kind: { type: String, default: 'task' },
   },
   { _id: true }
 );

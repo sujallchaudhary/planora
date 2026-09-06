@@ -3,20 +3,21 @@ import { InlineKeyboard } from 'grammy';
 import { userRepo } from '../../memory/mongo/repositories/user.repo.js';
 import { taskRepo } from '../../memory/mongo/repositories/task.repo.js';
 import { scheduleRepo } from '../../memory/mongo/repositories/schedule.repo.js';
+import { preferenceRepo } from '../../memory/mongo/repositories/preference.repo.js';
+import { Habit } from '../../memory/mongo/models/habit.model.js';
+import { Constraint } from '../../memory/mongo/models/constraint.model.js';
 import { resolveUserConfig } from '../../config/config-resolver.js';
-import { planSchedule } from '../../scheduler/planner.js';
+import { replanDay, formatScheduleLines, describeUnscheduled } from '../../scheduler/replan-service.js';
 import { syncReminders } from '../../execution/job-manager.js';
-import { HybridRetriever } from '../../memory/hybrid-retriever.js';
-import { SemanticMemory } from '../../memory/qdrant/semantic-memory.js';
-import { getLLMProvider } from '../../llm/openai-compatible.provider.js';
-import { todayString, formatTimeHuman } from '../../utils/date.js';
-import { scheduleDailyPlans } from '../../execution/workers/daily-plan.worker.js';
+import { scheduleDailyPlanForUser } from '../../execution/workers/daily-plan.worker.js';
+import { scheduleAnalyticsForUser } from '../../execution/workers/analytics.worker.js';
+import { todayString, formatTimeHuman, formatDateString, formatDateHuman, formatMinutes } from '../../utils/date.js';
+import { describeDays } from '../../memory/memory-utils.js';
+import { md } from '../../utils/markdown.js';
+import { sendReply } from './message.handler.js';
 import { createChildLogger } from '../../utils/logger.js';
 
 const log = createChildLogger('handler:command');
-
-/** Escape special Markdown v1 characters in dynamic content. */
-const md = (s: string) => s.replace(/[_*[\]`]/g, '\\$&');
 
 export function registerCommandHandlers(bot: any): void {
   bot.command('start', async (ctx: Context) => {
@@ -29,75 +30,53 @@ export function registerCommandHandlers(bot: any): void {
       username: from.username,
     });
 
-    // Schedule daily plan for THIS user only, not all users
     try {
       const config = resolveUserConfig(user.settings);
-      const [hour, minute] = config.dailyPlanTime.split(':');
-      const { getDailyPlanQueue } = await import('../../execution/queue.js');
-      await getDailyPlanQueue().add(
-        'generate-plan',
-        { telegramId: user.telegramId },
-        {
-          jobId: `daily-plan_${user.telegramId}`,
-          repeat: { pattern: `0 ${minute} ${hour} * * *`, tz: config.timezone },
-          removeOnComplete: { count: 10 },
-        }
-      );
-    } catch (e) { /* ignore */ }
+      await scheduleDailyPlanForUser(user.telegramId, config.dailyPlanTime, config.timezone);
+      await scheduleAnalyticsForUser(user.telegramId, config.analyticsTime, config.timezone);
+    } catch (e) {
+      log.warn({ e }, 'Failed to schedule recurring jobs on /start');
+    }
 
-    await ctx.reply(
-      `👋 Hey ${from.first_name}! I'm Memora, your personal operating system.\n\n` +
-      `Here's what I can do:\n` +
-      `📋 Tell me your tasks in natural language\n` +
-      `📸 Send me photos of schedules or task lists\n` +
-      `⏰ I'll plan your day and send reminders\n` +
-      `🔄 Say "replan" anytime to adjust\n\n` +
-      `Just start telling me what you need to do today!`
+    await sendReply(ctx,
+      `Hey ${md(from.first_name)} — I'm Memora, and I run your day so you don't have to.\n\n` +
+      `Just talk to me like you would to a chief of staff:\n` +
+      `• _"Finish the report by Friday, 2 hours, high priority"_\n` +
+      `• _"I have class every day 10–11:30"_ · _"I focus better at night"_\n` +
+      `• _"Done with the report"_ · _"Skip gym today"_ · _"I'm exhausted"_\n` +
+      `• 📸 Send a photo of a timetable or to-do list\n\n` +
+      `Every morning I'll send your plan, nudge you through it, replan when life happens, and review the day at night. ` +
+      `The more you tell me, the better I get.`
     );
   });
 
   bot.command('plan', async (ctx: Context) => {
     const from = ctx.from;
     if (!from) return;
-
     const user = await userRepo.findByTelegramId(from.id);
-    if (!user) {
-      await ctx.reply('Please send /start first to register.');
-      return;
-    }
+    if (!user) { await ctx.reply('Please send /start first.'); return; }
 
     const config = resolveUserConfig(user.settings);
     const today = todayString(config.timezone);
+    void ctx.replyWithChatAction('typing').catch(() => undefined);
 
-    await ctx.reply('🔄 Planning your day...');
-
-    const tasks = await taskRepo.findPendingTasks(from.id);
-
-    const llm = getLLMProvider();
-    const semanticMemory = new SemanticMemory((t) => llm.getEmbedding(t));
-    const retriever = new HybridRetriever(semanticMemory);
-    const memory = await retriever.retrieve(from.id, `Daily plan for ${today}`, config.memoryConfidenceThreshold);
-    const entries = await planSchedule(tasks, memory, config, today);
-    const schedule = await scheduleRepo.createOrReplace(from.id, user._id, today, entries);
-    await syncReminders(from.id, today, schedule.entries);
-
-    const lines = entries.map(e => {
-      const s = formatTimeHuman(e.startTime, config.timezone);
-      const end = formatTimeHuman(e.endTime, config.timezone);
-      return `📋 ${s} – ${end}: *${md(e.title)}*`;
-    });
-
-    await ctx.reply(
-      `📅 *Your plan for today:*\n\n${lines.join('\n')}\n\n` +
-      `_${entries.length} tasks scheduled. Say "replan" to adjust._`,
-      { parse_mode: 'Markdown' }
+    const outcome = await replanDay(from.id, today, { trigger: 'manual_plan', scheduleStability: 'moderate' });
+    if (outcome.entries.length === 0) {
+      const open = await taskRepo.countPendingTasks(from.id);
+      await ctx.reply(open === 0 ? 'Nothing to plan — tell me what you need to do.' : `Nothing fits into what's left of today. ${describeUnscheduled(outcome.unscheduled, { escape: false })}`);
+      return;
+    }
+    const leftovers = describeUnscheduled(outcome.unscheduled);
+    await sendReply(ctx,
+      `📅 *Today's plan*\n\n${formatScheduleLines(outcome.entries, config.timezone).join('\n')}\n\n` +
+      `_${outcome.scheduledTaskCount} task block${outcome.scheduledTaskCount === 1 ? '' : 's'} to go. Say "replan" or just tell me what changed._` +
+      (leftovers ? `\n\n${leftovers}` : '')
     );
   });
 
   bot.command('status', async (ctx: Context) => {
     const from = ctx.from;
     if (!from) return;
-
     const user = await userRepo.findByTelegramId(from.id);
     if (!user) { await ctx.reply('Please /start first.'); return; }
 
@@ -107,185 +86,155 @@ export function registerCommandHandlers(bot: any): void {
     const pendingCount = await taskRepo.countPendingTasks(from.id);
 
     if (!schedule || schedule.entries.length === 0) {
-      await ctx.reply(`📊 *Status*\n\nPending tasks: ${pendingCount}\nNo schedule for today. Use /plan to create one.`, { parse_mode: 'Markdown' });
+      await sendReply(ctx, `📊 *Status*\n\nOpen tasks: ${pendingCount}\nNo plan for today yet — /plan or just tell me what's on.`);
       return;
     }
 
-    const completed = schedule.entries.filter(e => e.status === 'completed').length;
-    const remaining = schedule.entries.filter(e => e.status === 'scheduled').length;
-    const skipped = schedule.entries.filter(e => e.status === 'skipped').length;
+    const taskEntries = schedule.entries.filter(e => e.taskId);
+    const count = (s: string) => taskEntries.filter(e => e.status === s).length;
+    const next = schedule.entries.filter(e => e.status === 'scheduled' && new Date(e.endTime) > new Date()).sort((a, b) => +new Date(a.startTime) - +new Date(b.startTime))[0];
 
-    await ctx.reply(
-      `📊 *Today's Status*\n\n` +
-      `✅ Completed: ${completed}\n` +
-      `📋 Remaining: ${remaining}\n` +
-      `⏭ Skipped: ${skipped}\n` +
-      `📝 Pending tasks: ${pendingCount}`,
-      { parse_mode: 'Markdown' }
+    await sendReply(ctx,
+      `📊 *Today*\n\n` +
+      `✅ Done: ${count('completed')}\n` +
+      `📋 Remaining: ${count('scheduled') + count('active')}\n` +
+      `⏭ Skipped: ${count('skipped')} · ⚠️ Missed: ${count('missed')}\n` +
+      `📝 Open tasks overall: ${pendingCount}` +
+      (next ? `\n\nNext up: *${md(next.title)}* at ${formatTimeHuman(new Date(next.startTime), config.timezone)}` : '')
     );
   });
 
   bot.command('clear', async (ctx: Context) => {
     const from = ctx.from;
     if (!from) return;
-
     const user = await userRepo.findByTelegramId(from.id);
     if (!user) { await ctx.reply('Please /start first.'); return; }
 
     const config = resolveUserConfig(user.settings);
     const today = todayString(config.timezone);
-    await scheduleRepo.createOrReplace(from.id, user._id, today, []);
+    await scheduleRepo.createOrReplace(from.id, user._id as any, today, []);
     await syncReminders(from.id, today, []);
-
-    await ctx.reply('🗑 Schedule cleared for today. Use /plan to create a new one.');
+    await ctx.reply("Cleared today's plan and reminders. Your tasks are untouched — /plan rebuilds it.");
   });
 
   bot.command('tasks', async (ctx: Context) => {
     const from = ctx.from;
     if (!from) return;
-
     const user = await userRepo.findByTelegramId(from.id);
     if (!user) { await ctx.reply('Please /start first.'); return; }
 
-    const tasks = await taskRepo.findByTelegramId(from.id, ['pending', 'scheduled']);
+    const config = resolveUserConfig(user.settings);
+    const today = todayString(config.timezone);
+    const tasks = await taskRepo.findOpenTasks(from.id);
     if (tasks.length === 0) {
-      await ctx.reply('📭 You have no pending tasks. Tell me what you need to do!');
+      await ctx.reply('No open tasks. Tell me what you need to do.');
       return;
     }
 
-    // Group by priority
     const priorityEmoji: Record<number, string> = { 5: '🔴', 4: '🟠', 3: '🟡', 2: '🔵', 1: '⚪' };
     const priorityLabel: Record<number, string> = { 5: 'Critical', 4: 'Urgent', 3: 'High', 2: 'Medium', 1: 'Low' };
     const groups: Record<number, string[]> = { 5: [], 4: [], 3: [], 2: [], 1: [] };
 
     for (const task of tasks) {
       const p = task.priority ?? 2;
-      const emoji = priorityEmoji[p] ?? '🔵';
-      let line = `${emoji} *${md(task.title)}*`;
-
-      // Time info
-      if (task.isFixed && task.fixedStartTime && task.fixedEndTime) {
-        line += ` _(fixed: ${task.fixedStartTime}–${task.fixedEndTime})_`;
-      } else if (task.estimatedMinutes) {
-        const hrs = Math.floor(task.estimatedMinutes / 60);
-        const mins = task.estimatedMinutes % 60;
-        const timeStr = hrs > 0 ? `${hrs}h${mins > 0 ? ` ${mins}m` : ''}` : `${mins}m`;
-        line += ` _[${timeStr}]_`;
-      }
-
-      // Due date
+      let line = `${priorityEmoji[p] ?? '🔵'} *${md(task.title)}*`;
+      if (task.isFixed && task.fixedStartTime && task.fixedEndTime) line += ` _(${task.fixedStartTime}–${task.fixedEndTime})_`;
+      else line += ` _[${formatMinutes(task.estimatedMinutes ?? 30)}]_`;
       if (task.dueDate) {
-        const due = new Date(task.dueDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
-        line += ` \u2014 due ${md(due)}`;
+        const dueStr = formatDateString(task.dueDate, config.timezone);
+        line += dueStr < today ? ` — *overdue* (${md(formatDateHuman(dueStr))})` : ` — due ${md(formatDateHuman(dueStr))}`;
       }
-
-      // Status badge
-      if (task.status === 'scheduled') line += ' ✓ _scheduled_';
-
+      if (task.recurrence?.pattern) line += ` 🔁`;
+      if (task.deferredUntil && task.deferredUntil > today) line += ` _(from ${md(formatDateHuman(task.deferredUntil))})_`;
+      if (task.deferCount >= 2) line += ` _(slipped ${task.deferCount}x)_`;
       (groups[p] ?? groups[2]!).push(line);
     }
 
     const sections: string[] = [];
     for (const p of [5, 4, 3, 2, 1]) {
-      const group = groups[p]!;
-      if (group.length > 0) {
-        sections.push(`*${priorityEmoji[p]} ${priorityLabel[p]}*\n${group.join('\n')}`);
-      }
+      if (groups[p]!.length > 0) sections.push(`*${priorityEmoji[p]} ${priorityLabel[p]}*\n${groups[p]!.join('\n')}`);
     }
-
-    const config = resolveUserConfig(user.settings);
     const totalMins = tasks.reduce((sum, t) => sum + (t.estimatedMinutes ?? 30), 0);
-    const totalHrs = Math.floor(totalMins / 60);
-    const totalRemMins = totalMins % 60;
-    const totalStr = totalHrs > 0 ? `${totalHrs}h ${totalRemMins}m` : `${totalMins}m`;
 
-    await ctx.reply(
-      `📋 *Your Tasks* (${tasks.length} pending · ${totalStr} total)\n\n` +
-      sections.join('\n\n') +
-      `\n\n_Use /plan to schedule them_`,
-      { parse_mode: 'Markdown' }
-    );
+    await sendReply(ctx, `📋 *Open tasks* (${tasks.length} · ${formatMinutes(totalMins)} of work)\n\n${sections.join('\n\n')}`);
   });
 
   bot.command('schedule', async (ctx: Context) => {
     const from = ctx.from;
     if (!from) return;
-
     const user = await userRepo.findByTelegramId(from.id);
     if (!user) { await ctx.reply('Please /start first.'); return; }
 
     const config = resolveUserConfig(user.settings);
     const today = todayString(config.timezone);
     const schedule = await scheduleRepo.findByDate(from.id, today);
-
     if (!schedule || schedule.entries.length === 0) {
-      await ctx.reply('📭 No schedule for today. Use /plan to create one.');
+      await ctx.reply('No plan for today yet. /plan builds one.');
       return;
     }
 
-    const statusEmoji = (s: string) =>
-      s === 'completed' ? '✅' : s === 'skipped' ? '⏭' : s === 'active' ? '▶️' : '📋';
-
-    const sorted = [...schedule.entries].sort(
-      (a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime()
-    );
-
+    const sorted = [...schedule.entries].sort((a, b) => +new Date(a.startTime) - +new Date(b.startTime));
     const completed = sorted.filter(e => e.status === 'completed').length;
     const remaining = sorted.filter(e => e.status === 'scheduled' || e.status === 'active').length;
 
-    const lines = sorted.map(e => {
-      const s = formatTimeHuman(new Date(e.startTime), config.timezone);
-      const end = formatTimeHuman(new Date(e.endTime), config.timezone);
-      return `${statusEmoji(e.status)} ${s}–${end} *${md(e.title)}*`;
-    });
-
-    await ctx.reply(
-      `📅 *Today's Schedule* — ${today}\n` +
-      `✅ ${completed} done · 📋 ${remaining} remaining\n\n` +
-      lines.join('\n') +
-      `\n\n_Tap ✅ Done on an entry below, or say "done with taskname"_`,
-      { parse_mode: 'Markdown' }
+    await sendReply(ctx,
+      `📅 *Today* — ${formatDateHuman(today)}\n✅ ${completed} done · 📋 ${remaining} remaining\n\n` +
+      formatScheduleLines(sorted, config.timezone).join('\n') +
+      `\n\n_Tap a button below, or just say "done with X"._`
     );
 
-    // Send a button row for each pending entry
     for (const entry of sorted) {
       if (entry.status !== 'scheduled' && entry.status !== 'active') continue;
-      const entryId = (entry as any)._id?.toString() ?? '';
-      const s = formatTimeHuman(new Date(entry.startTime), config.timezone);
-      const end = formatTimeHuman(new Date(entry.endTime), config.timezone);
-
+      if (new Date(entry.endTime) < new Date()) continue;
+      const entryId = entry._id?.toString() ?? '';
       const kb = new InlineKeyboard()
         .text('✅ Done', `task|done|${entryId}`)
-        .text('⏭ Skip', `task|skip|${entryId}`);
-
-      await ctx.reply(
-        `📋 *${md(entry.title)}* — ${s}–${end}`,
-        { parse_mode: 'Markdown', reply_markup: kb }
-      );
+        .text('⏭ Skip', `task|skip|${entryId}`)
+        .text('📅 Move', `task|reschedule|${entryId}`);
+      await sendReply(ctx, `${md(entry.title)} — ${formatTimeHuman(new Date(entry.startTime), config.timezone)}–${formatTimeHuman(new Date(entry.endTime), config.timezone)}`).catch(() => undefined);
+      await ctx.reply('▸', { reply_markup: kb }).catch(() => undefined);
     }
   });
 
-  bot.command('help', async (ctx: Context) => {
+  bot.command('memory', async (ctx: Context) => {
+    const from = ctx.from;
+    if (!from) return;
+    const user = await userRepo.findByTelegramId(from.id);
+    if (!user) { await ctx.reply('Please /start first.'); return; }
 
-    await ctx.reply(
-      `🤖 *Memora Personal Operating System*\n\n` +
-      `*Commands:*\n` +
-      `/start — Register and get started\n` +
-      `/tasks — View all your pending tasks\n` +
-      `/plan — Generate today's schedule\n` +
-      `/schedule — View today's schedule with action buttons\n` +
-      `/status — See today's progress\n` +
-      `/clear — Clear today's schedule\n\n` +
-      `*Mark tasks complete by:*\n` +
-      `• Tapping ✅ Done button on a reminder or /schedule entry\n` +
-      `• Saying _"done with gym"_ or _"finished math"_\n\n` +
-      `*Just chat naturally:*\n` +
-      `• _"Study math for 2 hours, high priority"_\n` +
-      `• _"I have class at 10am–11:30am"_\n` +
-      `• _"Skip gym today"_\n` +
-      `• _"I'm tired, replan my day"_\n\n` +
-      `📸 You can also send me photos of schedules or task lists!`,
-      { parse_mode: 'Markdown' }
+    const [habits, constraints, prefs] = await Promise.all([
+      Habit.find({ telegramId: from.id, isActive: true }),
+      Constraint.find({ telegramId: from.id, isActive: true }),
+      preferenceRepo.findByTelegramId(from.id),
+    ]);
+
+    const sections: string[] = ['🧠 *What I know about you*'];
+    if (constraints.length) sections.push('*Fixed commitments*\n' + constraints.map(c => `• ${md(c.key.replace(/_/g, ' '))}${c.timeRange.start !== '00:00' ? ` ${c.timeRange.start}–${c.timeRange.end}` : ''} (${describeDays(c.days)})${c.expiresOn ? ` until ${c.expiresOn}` : ''}`).join('\n'));
+    if (habits.length) sections.push('*Routines*\n' + habits.map(h => `• ${md(h.key.replace(/_/g, ' '))} ${h.timeRange.start}–${h.timeRange.end} (${describeDays(h.days)})`).join('\n'));
+    if (prefs.length) sections.push('*Preferences*\n' + prefs.map(p => `• ${md(p.key.replace(/_/g, ' '))}: ${md(p.value)}${p.source === 'inferred' ? ' _(learned)_' : ''}`).join('\n'));
+    if (sections.length === 1) sections.push("Nothing yet. Tell me about your routines, commitments and when you work best.");
+    sections.push('_Say "I stopped ..." or "forget that ..." to remove any of these._');
+
+    await sendReply(ctx, sections.join('\n\n'));
+  });
+
+  bot.command('help', async (ctx: Context) => {
+    await sendReply(ctx,
+      `🤖 *Memora*\n\n` +
+      `*Commands*\n` +
+      `/plan — build or rebuild today\n` +
+      `/schedule — today's timeline with buttons\n` +
+      `/tasks — everything open\n` +
+      `/status — how today is going\n` +
+      `/memory — what I've learned about you\n` +
+      `/clear — wipe today's plan\n\n` +
+      `*Or just talk*\n` +
+      `• _"Study math 2h, due Friday"_ · _"Dentist tomorrow at 3"_\n` +
+      `• _"Done with math"_ · _"Skip gym today"_ · _"Move the report to Friday"_\n` +
+      `• _"I'm exhausted"_ · _"Running late"_ · _"I'm out till 5"_ — I'll replan\n` +
+      `• _"I focus better at night"_ · _"I nap 2–3"_ — I'll remember\n` +
+      `• _"Exams are over"_ — I'll forget the exam constraint\n` +
+      `📸 Photos of timetables or lists work too.`
     );
   });
 }

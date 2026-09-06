@@ -8,6 +8,7 @@ import { startDailyPlanWorker, scheduleDailyPlans } from './execution/workers/da
 import { startAnalyticsWorker, scheduleAnalytics } from './execution/workers/analytics.worker.js';
 import { closeQueues } from './execution/queue.js';
 import { logger } from './utils/logger.js';
+import { getLLMProvider } from './llm/index.js';
 
 async function main() {
   logger.info('🚀 Starting Telegram Personal Assistant...');
@@ -23,7 +24,14 @@ async function main() {
     logger.warn({ err }, 'Qdrant initialization failed — semantic memory will be unavailable');
   }
 
-  // Step 3: Create Telegram bot
+  // Step 3: Warm the LLM service (loads the local embedding model if configured)
+  try {
+    await getLLMProvider().warmup();
+  } catch (err) {
+    logger.warn({ err }, 'LLM warmup failed — first request will retry');
+  }
+
+  // Step 4: Create Telegram bot
   createBot();
 
   // Step 4: Start BullMQ workers

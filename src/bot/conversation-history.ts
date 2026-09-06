@@ -1,36 +1,45 @@
 /**
- * Lightweight in-memory conversation history per user.
- * Stores the last N message pairs so the LLM has context for follow-up messages.
- * Resets on server restart (acceptable for a personal assistant).
+ * Conversation history per user, kept in Redis so it survives restarts and
+ * works across multiple bot instances. Holds the last N turns for LLM context.
  */
+import { getRedisConnection } from '../execution/queue.js';
+import { createChildLogger } from '../utils/logger.js';
+
+const log = createChildLogger('conversation-history');
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
 }
 
-const MAX_HISTORY = 6; // 3 user + 3 assistant turns
+const MAX_HISTORY = 8;          // 4 user + 4 assistant turns
+const MAX_CONTENT_CHARS = 1500; // keep prompts small
+const TTL_SECONDS = 12 * 3600;
 
-// Map<telegramId, messages>
-const store = new Map<number, ChatMessage[]>();
+const key = (telegramId: number) => `memora:conv:${telegramId}`;
 
-export function appendHistory(telegramId: number, role: 'user' | 'assistant', content: string): void {
-  if (!store.has(telegramId)) {
-    store.set(telegramId, []);
-  }
-  const history = store.get(telegramId)!;
-  history.push({ role, content });
-
-  // Keep only last MAX_HISTORY messages
-  if (history.length > MAX_HISTORY) {
-    store.set(telegramId, history.slice(-MAX_HISTORY));
+export async function appendHistory(telegramId: number, role: 'user' | 'assistant', content: string): Promise<void> {
+  try {
+    const redis = getRedisConnection();
+    const msg: ChatMessage = { role, content: content.slice(0, MAX_CONTENT_CHARS) };
+    await redis.rpush(key(telegramId), JSON.stringify(msg));
+    await redis.ltrim(key(telegramId), -MAX_HISTORY, -1);
+    await redis.expire(key(telegramId), TTL_SECONDS);
+  } catch (err) {
+    log.warn({ err }, 'Failed to append conversation history');
   }
 }
 
-export function getHistory(telegramId: number): ChatMessage[] {
-  return store.get(telegramId) ?? [];
+export async function getHistory(telegramId: number): Promise<ChatMessage[]> {
+  try {
+    const raw = await getRedisConnection().lrange(key(telegramId), 0, -1);
+    return raw.map(r => JSON.parse(r) as ChatMessage);
+  } catch (err) {
+    log.warn({ err }, 'Failed to read conversation history');
+    return [];
+  }
 }
 
-export function clearHistory(telegramId: number): void {
-  store.delete(telegramId);
+export async function clearHistory(telegramId: number): Promise<void> {
+  await getRedisConnection().del(key(telegramId)).catch(() => undefined);
 }

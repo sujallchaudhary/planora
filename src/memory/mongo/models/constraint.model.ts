@@ -12,6 +12,10 @@ export interface IConstraint extends Document {
   days: string[];  // ['monday', 'wednesday'] or ['daily']
   isRecurring: boolean;
   specificDate?: Date;
+  /** yyyy-MM-dd — the constraint stops applying after this day (e.g. exam period). */
+  expiresOn?: string;
+  confidence: number;
+  dataPoints: number;
   isActive: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -30,6 +34,9 @@ const constraintSchema = new Schema<IConstraint>(
     days: [{ type: String }],
     isRecurring: { type: Boolean, default: true },
     specificDate: { type: Date },
+    expiresOn: { type: String },
+    confidence: { type: Number, default: 0.8, min: 0, max: 1 },
+    dataPoints: { type: Number, default: 1 },
     isActive: { type: Boolean, default: true },
   },
   { timestamps: true }

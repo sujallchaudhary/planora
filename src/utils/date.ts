@@ -1,18 +1,37 @@
-import { format, parse, addMinutes, differenceInMinutes, isAfter, isBefore, isEqual, startOfDay, setHours, setMinutes } from 'date-fns';
+import { format, addMinutes, differenceInMinutes, isAfter, isBefore, isEqual } from 'date-fns';
 import { toZonedTime, fromZonedTime } from 'date-fns-tz';
 
-/**
- * Get the current time in a specific timezone.
- */
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Current wall-clock time in a timezone (as a "fake local" Date — only use for reading hours/minutes). */
 export function nowInTimezone(timezone: string): Date {
   return toZonedTime(new Date(), timezone);
 }
 
+/**
+ * Normalize loose time strings ("9", "9:30", "9am", "9:30 pm", "21:00", "10.15") into HH:mm.
+ * Returns null if it cannot be understood.
+ */
+export function normalizeTimeString(input: string | undefined | null): string | null {
+  if (!input) return null;
+  const s = String(input).trim().toLowerCase();
+  const m = s.match(/^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm)?$/);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = Number(m[2] ?? '0');
+  const ap = m[3];
+  if (ap === 'pm' && h < 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  if (h > 23 || min > 59) return null;
+  return `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+}
+
+/** Build an absolute Date for a wall-clock HH:mm on a given calendar day in a timezone. */
 export function parseTimeString(timeStr: string, date: Date | string, timezone: string): Date {
-  let yyyy, MM, dd;
-  
+  let yyyy: string | number, MM: string | number, dd: string | number;
+
   if (typeof date === 'string') {
-    [yyyy, MM, dd] = date.split('-');
+    [yyyy, MM, dd] = date.split('-') as [string, string, string];
   } else {
     const zonedDate = toZonedTime(date, timezone);
     yyyy = zonedDate.getFullYear();
@@ -20,103 +39,109 @@ export function parseTimeString(timeStr: string, date: Date | string, timezone: 
     dd = String(zonedDate.getDate()).padStart(2, '0');
   }
 
-  const [hours, minutes] = timeStr.split(':');
-  const hh = String(hours).padStart(2, '0');
-  const mm = String(minutes).padStart(2, '0');
-
-  const isoString = `${yyyy}-${MM}-${dd}T${hh}:${mm}:00`;
+  const normalized = normalizeTimeString(timeStr) ?? '00:00';
+  const isoString = `${yyyy}-${MM}-${dd}T${normalized}:00`;
   return fromZonedTime(isoString, timezone);
 }
 
-/**
- * Format a Date to a time string (HH:mm) in a specific timezone.
- */
 export function formatTime(date: Date, timezone: string): string {
-  const zoned = toZonedTime(date, timezone);
-  return format(zoned, 'HH:mm');
+  return format(toZonedTime(date, timezone), 'HH:mm');
 }
 
-/**
- * Format a Date to a human-friendly time string (h:mm a) in a specific timezone.
- */
 export function formatTimeHuman(date: Date, timezone: string): string {
-  const zoned = toZonedTime(date, timezone);
-  return format(zoned, 'h:mm a');
+  return format(toZonedTime(date, timezone), 'h:mm a');
 }
 
-/**
- * Format a Date to a date string (yyyy-MM-dd) in a specific timezone.
- */
 export function formatDateString(date: Date, timezone: string): string {
-  const zoned = toZonedTime(date, timezone);
-  return format(zoned, 'yyyy-MM-dd');
+  return format(toZonedTime(date, timezone), 'yyyy-MM-dd');
 }
 
-/**
- * Get today's date string in a specific timezone.
- */
+export function formatDateHuman(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y!, m! - 1, d!)).toLocaleDateString('en-US', {
+    weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC',
+  });
+}
+
 export function todayString(timezone: string): string {
   return formatDateString(new Date(), timezone);
 }
 
-/**
- * Get the "planning date" string — what the user considers "today".
- * In late-night mode (before threshold hour), this is the current calendar day
- * (wall clock), since the user is planning for the day they'll wake into.
- * e.g. at 2 AM on May 4th → planning date = May 4th.
- */
-export function planningDateString(timezone: string, lateNightThresholdHour = 4): string {
-  // Planning date is always the wall clock date — no shift needed.
-  // The only thing late-night mode affects is what "tomorrow" resolves to.
+/** Wall-clock hour (0-23) of an instant in a timezone. */
+export function hourInTimezone(date: Date, timezone: string): number {
+  return toZonedTime(date, timezone).getHours();
+}
+
+/** The date the user considers "today" (wall-clock date). */
+export function planningDateString(timezone: string, _lateNightThresholdHour = 4): string {
   return formatDateString(new Date(), timezone);
 }
 
 /**
- * Get "tomorrow" relative to the user's planning perspective.
- * In late-night mode (before threshold): "tomorrow" = today (wall clock),
- * because the user hasn't slept yet and refers to the coming day as tomorrow.
- * e.g. at 2 AM on May 4th: "tomorrow" = May 4th (not May 5th).
+ * "Tomorrow" from the user's perspective. Before the late-night threshold (e.g. 2 AM)
+ * the user hasn't slept yet, so "tomorrow" is the current calendar day.
  */
 export function tomorrowString(timezone: string, lateNightThresholdHour = 4): string {
   const now = toZonedTime(new Date(), timezone);
-  const localHour = now.getHours();
-  // Before threshold: "tomorrow" = today (they'll sleep and wake to this day)
-  if (localHour < lateNightThresholdHour) {
+  if (now.getHours() < lateNightThresholdHour) {
     return format(now, 'yyyy-MM-dd');
   }
-  // Normal: tomorrow = +1 day
-  const tomorrow = new Date(now);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  return format(tomorrow, 'yyyy-MM-dd');
+  return addDaysToDateString(format(now, 'yyyy-MM-dd'), 1);
 }
 
-/**
- * Calculate the delay in milliseconds from now to a target time.
- * Returns 0 if the target is in the past.
- */
+export function isValidDateString(value: unknown): value is string {
+  return typeof value === 'string' && DATE_RE.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+/** Pure calendar arithmetic on yyyy-MM-dd strings. */
+export function addDaysToDateString(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y!, m! - 1, d! + days)).toISOString().slice(0, 10);
+}
+
+/** Whole days from `fromStr` to `toStr` (negative if `toStr` is earlier). */
+export function daysBetween(fromStr: string, toStr: string): number {
+  const [fy, fm, fd] = fromStr.split('-').map(Number);
+  const [ty, tm, td] = toStr.split('-').map(Number);
+  return Math.round((Date.UTC(ty!, tm! - 1, td!) - Date.UTC(fy!, fm! - 1, fd!)) / 86_400_000);
+}
+
+export function weekdayOfDateString(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y!, m! - 1, d!))
+    .toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' })
+    .toLowerCase();
+}
+
+/** Midnight at the start of a calendar day in the user's timezone. */
+export function dateStringToDate(dateStr: string, timezone: string): Date {
+  return parseTimeString('00:00', dateStr, timezone);
+}
+
+export function roundUpToMinutes(date: Date, stepMinutes: number): Date {
+  const ms = stepMinutes * 60_000;
+  return new Date(Math.ceil(date.getTime() / ms) * ms);
+}
+
 export function msUntil(targetDate: Date): number {
-  const now = new Date();
-  const diff = targetDate.getTime() - now.getTime();
-  return Math.max(0, diff);
+  return Math.max(0, targetDate.getTime() - Date.now());
 }
 
-/**
- * Check if a time falls within a range (inclusive of start, exclusive of end).
- */
 export function isTimeInRange(time: Date, start: Date, end: Date): boolean {
   return (isAfter(time, start) || isEqual(time, start)) && isBefore(time, end);
 }
 
-/**
- * Get the duration in minutes between two dates.
- */
 export function durationMinutes(start: Date, end: Date): number {
   return differenceInMinutes(end, start);
 }
 
-/**
- * Add minutes to a date.
- */
 export function addMins(date: Date, minutes: number): Date {
   return addMinutes(date, minutes);
+}
+
+export function formatMinutes(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes % 60);
+  if (h === 0) return `${m}m`;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
 }

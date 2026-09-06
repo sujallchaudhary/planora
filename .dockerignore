@@ -4,3 +4,6 @@ dist
 .git
 *.md
 test-*.ts
+
+.cache
+.scratch

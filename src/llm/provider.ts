@@ -9,9 +9,9 @@ export interface UserContext {
   timezone: string;
   currentTime: string;
   currentDate: string;
-  /** The date the user considers 'today' — shifted back if before lateNightThresholdHour */
+  /** The date the user considers 'today' */
   planningDate?: string;
-  /** The date the user considers 'tomorrow' — shifted accordingly */
+  /** The date the user considers 'tomorrow' — shifted in late-night mode */
   tomorrowDate?: string;
   /** True if current time is before the late-night threshold */
   isLateNight?: boolean;
@@ -30,35 +30,9 @@ export interface ActionResult {
 }
 
 export interface LLMProvider {
-  /**
-   * Single LLM call: classify intent + extract tasks + extract memory signals.
-   */
   classifyAndExtract(input: string, context: UserContext): Promise<ClassificationResult>;
-
-  /**
-   * Generate a natural language response based on the action result and context.
-   */
-  generateResponse(
-    input: string,
-    classification: ClassificationResult,
-    result: ActionResult,
-    context: UserContext,
-  ): Promise<string>;
-
-  /**
-   * Extract content from an image (base64 encoded).
-   */
+  generateResponse(input: string, classification: ClassificationResult, result: ActionResult, context: UserContext): Promise<string>;
   extractImageContent(imageBase64: string, mimeType: string): Promise<ImageExtractionResult>;
-
-  /**
-   * Generate an embedding vector for text.
-   */
   getEmbedding(text: string): Promise<number[]>;
-
-  generateScheduleBlueprint(
-    tasks: ITask[],
-    memory: RetrievedMemory,
-    config: UserConfig,
-    targetDate: string
-  ): Promise<ScheduleBlueprint | null>;
+  generateScheduleBlueprint(tasks: ITask[], memory: RetrievedMemory, config: UserConfig, targetDate: string): Promise<ScheduleBlueprint | null>;
 }
