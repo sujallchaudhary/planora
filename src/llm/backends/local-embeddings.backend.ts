@@ -18,7 +18,14 @@ export class LocalEmbeddingBackend implements EmbeddingBackend {
     if (!this.extractor) {
       this.extractor = (async () => {
         const t0 = Date.now();
-        const tf = await import('@huggingface/transformers');
+        // Variable specifier: the package is optional, so neither tsc nor the bundle must resolve it.
+        const moduleName = '@huggingface/transformers';
+        let tf: any;
+        try {
+          tf = await import(moduleName);
+        } catch (err: any) {
+          throw new Error(`EMBEDDING_PROVIDER=local needs @huggingface/transformers installed (npm install --include=optional, or build the image with WITH_LOCAL_EMBEDDINGS=true): ${err?.message ?? err}`);
+        }
         tf.env.cacheDir = this.cacheDir;
         const pipe = await tf.pipeline('feature-extraction', this.model, { dtype: 'fp32' });
         log.info({ model: this.model, ms: Date.now() - t0 }, 'Local embedding model loaded');
